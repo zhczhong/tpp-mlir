@@ -12,6 +12,7 @@ add_mlir_library(TPPTransforms
   RewriteConvsToMatmulOrBrgemm.cpp
   RewriteConvToMatmulImpl.cpp
   RewriteToBatchReduceGemm.cpp
+  RewriteMatmulToNestedMatmul.cpp
   TileConsumerAndFuseProducers.cpp
   ToBlockLayoutAndBack.cpp
   TransformUtils.cpp

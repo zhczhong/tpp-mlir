@@ -179,6 +179,16 @@ def RewriteConvToMatmulOrBrgemm : Pass<"rewrite-conv-to-matmul-or-brgemm",
   let dependentDialects = ["scf::SCFDialect", "linalg::LinalgDialect"];
 }
 
+def RewriteMatmulToNestedMatmul : Pass<"rewrite-matmul-to-nested-matmul",
+                                       "ModuleOp"> {
+  let summary = "Rewrite matmul to parallel and tiled brgemm.";
+  let description = [{
+    Parallelize and tile the matmul, convert the innertmost matmul to brgemm.
+  }];
+  let options = [];
+  let dependentDialects = ["scf::SCFDialect", "linalg::LinalgDialect", "tensor::TensorDialect"];
+}
+
 def RewriteBatchMatmulToMatmul : Pass<"rewrite-batch-matmul-to-matmul",
                                       "func::FuncOp"> {
   let summary = "Rewrite a linalg.batch_matmul to linalg.matmul.";
