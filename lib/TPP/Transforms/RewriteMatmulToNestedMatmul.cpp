@@ -61,14 +61,14 @@ MatmulConfig getDefaultMatmulConfig(linalg::MatmulOp &linalgOp) {
   auto KNumBlock = K / cfg.innerMostKBlock;
 
   // Threads
-  cfg.MThreads = 1;
-  cfg.NThreads = 1;
-  cfg.KThreads = 2;
+  cfg.MThreads = 2;
+  cfg.NThreads = 2;
+  cfg.KThreads = 1;
 
   // Block
-  cfg.MBlock = divAndCeil((int)MNumBlock, cfg.MThreads);
-  cfg.NBlock = divAndCeil((int)NNumBlock, cfg.NThreads);
-  cfg.KBlock = divAndCeil((int)KNumBlock, cfg.KThreads);
+  cfg.MBlock = divAndCeil((int)MNumBlock, cfg.MThreads) * cfg.innerMostMBlock;
+  cfg.NBlock = divAndCeil((int)NNumBlock, cfg.NThreads) * cfg.innerMostNBlock;
+  cfg.KBlock = divAndCeil((int)KNumBlock, cfg.KThreads) * cfg.innerMostKBlock;
   return cfg;
 }
 
@@ -159,12 +159,12 @@ struct RewriteMatmulToNestedMatmul
 
       MatmulConfig cfg = getDefaultMatmulConfig(matmulOp);
       linalg::LinalgOp genericOp;
+      bool useBlockedLayout = true;
 
       // Step 2. Pack to Mkmk(innerMostMBlock, innerMostKBlock) amd
       // NKkn(inermostKBlock, innermostNBlock)
       {
         OpBuilder::InsertionGuard guard(rewriter);
-        bool useBlockedLayout = false;
         if (useBlockedLayout) {
           SmallVector<OpFoldResult> packSizes(
               matmulOp.getNumLoops(),
@@ -206,7 +206,6 @@ struct RewriteMatmulToNestedMatmul
             getAsIndexOpFoldResult(rewriter.getContext(), cfg.MThreads);
         numThreads[NDims[0]] =
             getAsIndexOpFoldResult(rewriter.getContext(), cfg.NThreads);
-        numThreads[KDims[0]] = getAsIndexOpFoldResult(rewriter.getContext(), 0);
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPoint(genericOp);
         auto tilingResult = linalg::tileToForallOp(
@@ -223,31 +222,27 @@ struct RewriteMatmulToNestedMatmul
       // TODO: move the reduction dim to the front. (M, N, threads) ->
       // (threads, M, N)
       {
-        if (cfg.KThreads > 1) {
+        // TODO: support more than one reduction dim
+        if (cfg.KThreads > 1 && !useBlockedLayout) {
           if (genericOp.hasPureBufferSemantics())
             return signalPassFailure();
-          SmallVector<OpFoldResult> tileSize(
+          SmallVector<OpFoldResult> numThreads(
               genericOp.getNumLoops(),
               getAsIndexOpFoldResult(rewriter.getContext(), 0));
-          tileSize[KDims[0]] =
-              getAsIndexOpFoldResult(rewriter.getContext(), cfg.KThreads);
           bool isFirstReductionDim = true;
           for (auto reductionDim : KDims) {
             if (isFirstReductionDim) {
-              tileSize[reductionDim] =
+              numThreads[reductionDim] =
                   getAsIndexOpFoldResult(rewriter.getContext(), cfg.KThreads);
               isFirstReductionDim = false;
-            } else {
-              tileSize[reductionDim] =
-                  getAsIndexOpFoldResult(rewriter.getContext(), 1);
             }
           }
 
           rewriter.setInsertionPoint(genericOp);
-          auto tilingResult = scf::tileReductionUsingScf(
+          auto tilingResult = linalg::tileReductionUsingForall(
               rewriter,
               cast<PartialReductionOpInterface>(genericOp.getOperation()),
-              tileSize);
+              numThreads);
           if (failed(tilingResult))
             return signalPassFailure();
           genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->parallelTiledOp);
@@ -262,12 +257,25 @@ struct RewriteMatmulToNestedMatmul
         SmallVector<OpFoldResult> TileSizes(
             genericOp.getNumLoops(),
             getAsIndexOpFoldResult(rewriter.getContext(), 0));
-        TileSizes[MDims[0]] = getAsIndexOpFoldResult(
-            rewriter.getContext(), (cfg.MBlock - 1) / cfg.innerMostMBlock + 1);
-        TileSizes[NDims[0]] = getAsIndexOpFoldResult(
-            rewriter.getContext(), (cfg.NBlock - 1) / cfg.innerMostNBlock + 1);
-        TileSizes[KDims[0]] = getAsIndexOpFoldResult(
-            rewriter.getContext(), (cfg.KBlock - 1) / cfg.innerMostKBlock + 1);
+        if (useBlockedLayout) {
+          TileSizes[MDims[0]] = getAsIndexOpFoldResult(
+              rewriter.getContext(),
+              (cfg.MBlock - 1) / cfg.innerMostMBlock + 1);
+          TileSizes[NDims[0]] = getAsIndexOpFoldResult(
+              rewriter.getContext(),
+              (cfg.NBlock - 1) / cfg.innerMostNBlock + 1);
+          TileSizes[KDims[0]] = getAsIndexOpFoldResult(
+              rewriter.getContext(),
+              (cfg.KBlock - 1) / cfg.innerMostKBlock + 1);
+        } else {
+          TileSizes[MDims[0]] =
+              getAsIndexOpFoldResult(rewriter.getContext(), cfg.MBlock);
+          TileSizes[NDims[0]] =
+              getAsIndexOpFoldResult(rewriter.getContext(), cfg.NBlock);
+          TileSizes[KDims[0]] =
+              getAsIndexOpFoldResult(rewriter.getContext(), cfg.KBlock);
+        }
+
         tileOption.setTileSizes(TileSizes);
 
         SmallVector<int64_t> interchange(genericOp.getNumLoops(), 0);
@@ -295,6 +303,14 @@ struct RewriteMatmulToNestedMatmul
             genericOp.getNumLoops(),
             getAsIndexOpFoldResult(rewriter.getContext(), 0));
         auto iteratorTypes = genericOp.getIteratorTypesArray();
+        TileSizes[MDims.back()] =
+            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostMBlock);
+        TileSizes[NDims.back()] =
+            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostNBlock);
+        if (!useBlockedLayout) {
+          TileSizes[KDims.back()] = getAsIndexOpFoldResult(
+              rewriter.getContext(), cfg.innerMostKBlock);
+        }
         for (auto dim = 0; dim < genericOp.getNumLoops(); dim++) {
           if (dim != MDims.back() && dim != NDims.back() &&
               iteratorTypes[dim] != mlir::utils::IteratorType::reduction) {
