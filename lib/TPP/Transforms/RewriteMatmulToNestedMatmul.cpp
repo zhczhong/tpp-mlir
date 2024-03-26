@@ -223,6 +223,8 @@ struct RewriteMatmulToNestedMatmul
       // (threads, M, N)
       {
         // TODO: support more than one reduction dim
+        // TODO: move the reduction dim to the front. [M, N, threads] ->
+        // [threads, M, N]
         if (cfg.KThreads > 1 && !useBlockedLayout) {
           if (genericOp.hasPureBufferSemantics())
             return signalPassFailure();
@@ -429,4 +431,40 @@ return %3 : tensor<256x512xf32>\
       loc, fnName.getValue(), TypeRange(), oprand);
   call.dump();
   exit(0);
+}*/
+
+/*if (cfg.KThreads > 1)
+{
+    if (genericOp.hasPureBufferSemantics())
+        return signalPassFailure();
+    SmallVector<OpFoldResult> tileSize(
+        genericOp.getNumLoops(),
+        getAsIndexOpFoldResult(rewriter.getContext(), 0));
+    tileSize[KDims[0]] =
+        getAsIndexOpFoldResult(rewriter.getContext(), cfg.KThreads );
+    bool isFirstReductionDim = true;
+    for (auto reductionDim : KDims)
+    {
+        if (isFirstReductionDim)
+        {
+            tileSize[reductionDim] =
+                getAsIndexOpFoldResult(rewriter.getContext(), cfg.KThreads);
+            isFirstReductionDim = false;
+        }
+        else
+        {
+            tileSize[reductionDim] =
+                getAsIndexOpFoldResult(rewriter.getContext(), 1);
+        }
+    }
+
+    rewriter.setInsertionPoint(genericOp);
+    auto tilingResult = scf::tileReductionUsingScf(
+        rewriter,
+        cast<PartialReductionOpInterface>(genericOp.getOperation()),
+        tileSize);
+    if (failed(tilingResult))
+        return signalPassFailure();
+    genericOp =
+        dyn_cast<linalg::GenericOp>(tilingResult->parallelTiledOp);
 }*/
