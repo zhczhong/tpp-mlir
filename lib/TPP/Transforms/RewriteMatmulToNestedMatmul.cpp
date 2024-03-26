@@ -43,8 +43,6 @@ template <typename T> inline T divAndCeil(T a, T b) { return (a - 1) / b + 1; }
 
 // TODO: Simple TTI interface
 
-// TODO: generlize layout
-
 MatmulConfig getDefaultMatmulConfig(linalg::MatmulOp &linalgOp) {
   auto M = linalgOp.getShape(linalgOp.getDpsInputOperand(0))[0],
        N = linalgOp.getShape(linalgOp.getDpsInputOperand(1))[1],
@@ -165,28 +163,31 @@ struct RewriteMatmulToNestedMatmul
       // Step 2. Pack to Mkmk(innerMostMBlock, innerMostKBlock) amd
       // NKkn(inermostKBlock, innermostNBlock)
       {
-        SmallVector<OpFoldResult> packSizes(
-            matmulOp.getNumLoops(),
-            getAsIndexOpFoldResult(rewriter.getContext(), 0));
-        packSizes[0] =
-            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostMBlock);
-        packSizes[1] =
-            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostNBlock);
-        packSizes[2] =
-            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostKBlock);
-
         OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPoint(matmulOp);
+        bool useBlockedLayout = false;
+        if (useBlockedLayout) {
+          SmallVector<OpFoldResult> packSizes(
+              matmulOp.getNumLoops(),
+              getAsIndexOpFoldResult(rewriter.getContext(), 0));
+          packSizes[0] = getAsIndexOpFoldResult(rewriter.getContext(),
+                                                cfg.innerMostMBlock);
+          packSizes[1] = getAsIndexOpFoldResult(rewriter.getContext(),
+                                                cfg.innerMostNBlock);
+          packSizes[2] = getAsIndexOpFoldResult(rewriter.getContext(),
+                                                cfg.innerMostKBlock);
+          rewriter.setInsertionPoint(matmulOp);
+          auto linalgOp =
+              mlir::linalgx::packMatmulOp(rewriter, matmulOp, packSizes);
 
-        auto linalgOp =
-            mlir::linalgx::packMatmulOp(rewriter, matmulOp, packSizes);
+          if (failed(linalgOp))
+            return signalPassFailure();
 
-        if (failed(linalgOp))
-          return signalPassFailure();
-
-        if (linalgOp->hasPureBufferSemantics())
-          return signalPassFailure();
-        genericOp = *linalgOp;
+          if (linalgOp->hasPureBufferSemantics())
+            return signalPassFailure();
+          genericOp = *linalgOp;
+        } else {
+          genericOp = dyn_cast<linalg::LinalgOp>(matmulOp.getOperation());
+        }
       }
 
       // Step 3. The processes of transforming matmul to nested matmul
@@ -215,7 +216,7 @@ struct RewriteMatmulToNestedMatmul
         if (failed(tilingResult))
           return signalPassFailure();
         rewriter.replaceOp(genericOp, tilingResult->tileOp->getResults());
-        genericOp = dyn_cast<linalg::GenericOp>(tilingResult->tiledOp);
+        genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->tiledOp);
       }
 
       // 3.2 Tiling reduction parallel loop with scf::forall
@@ -249,8 +250,7 @@ struct RewriteMatmulToNestedMatmul
               tileSize);
           if (failed(tilingResult))
             return signalPassFailure();
-          genericOp =
-              dyn_cast<linalg::GenericOp>(tilingResult->parallelTiledOp);
+          genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->parallelTiledOp);
         }
       }
 
@@ -284,7 +284,7 @@ struct RewriteMatmulToNestedMatmul
         if (failed(tilingResult))
           return signalPassFailure();
         rewriter.replaceOp(genericOp, tilingResult->replacements);
-        genericOp = dyn_cast<linalg::GenericOp>(tilingResult->tiledOps.back());
+        genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->tiledOps.back());
       }
 
       // 3.4 Tile innermost loop
@@ -294,8 +294,13 @@ struct RewriteMatmulToNestedMatmul
         SmallVector<OpFoldResult> TileSizes(
             genericOp.getNumLoops(),
             getAsIndexOpFoldResult(rewriter.getContext(), 0));
-        TileSizes[MDims[0]] = getAsIndexOpFoldResult(rewriter.getContext(), 1);
-        TileSizes[NDims[0]] = getAsIndexOpFoldResult(rewriter.getContext(), 1);
+        auto iteratorTypes = genericOp.getIteratorTypesArray();
+        for (auto dim = 0; dim < genericOp.getNumLoops(); dim++) {
+          if (dim != MDims.back() && dim != NDims.back() &&
+              iteratorTypes[dim] != mlir::utils::IteratorType::reduction) {
+            TileSizes[dim] = getAsIndexOpFoldResult(rewriter.getContext(), 1);
+          }
+        }
         tileOption.setTileSizes(TileSizes);
 
         // interchange loop order
