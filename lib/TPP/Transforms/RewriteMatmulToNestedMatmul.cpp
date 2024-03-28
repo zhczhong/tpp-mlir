@@ -307,6 +307,9 @@ struct RewriteMatmulToNestedMatmul
           SmallVector<OpFoldResult> tileSizes(
               genericOp.getNumLoops(),
               getAsIndexOpFoldResult(rewriter.getContext(), 0));
+          SmallVector<OpFoldResult> threads(
+              genericOp.getNumLoops(),
+              getAsIndexOpFoldResult(rewriter.getContext(), 0));
           bool isFirstReductionDim = true;
           for (auto reductionDim : KDimPos) {
             if (isFirstReductionDim) {
@@ -317,9 +320,13 @@ struct RewriteMatmulToNestedMatmul
                       : divAndCeil(divAndCeil(KFirstDim, cfg.KBlock),
                                    cfg.KThreads) *
                             cfg.KBlock);
+              threads[reductionDim] =
+                  getAsIndexOpFoldResult(rewriter.getContext(), cfg.KThreads);
               isFirstReductionDim = false;
             } else {
               tileSizes[reductionDim] =
+                  getAsIndexOpFoldResult(rewriter.getContext(), 1);
+              threads[reductionDim] =
                   getAsIndexOpFoldResult(rewriter.getContext(), 1);
             }
           }
@@ -327,11 +334,12 @@ struct RewriteMatmulToNestedMatmul
           rewriter.setInsertionPoint(genericOp);
           auto tilingResult = linalg::tileReductionUsingForall(
               rewriter,
-              cast<PartialReductionOpInterface>(genericOp.getOperation()), {},
-              tileSizes);
+              cast<PartialReductionOpInterface>(genericOp.getOperation()),
+              threads, tileSizes);
           if (failed(tilingResult))
             return signalPassFailure();
           genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->parallelTiledOp);
+          genericOp.getOperation()->getParentOfType<ModuleOp>().dump();
         }
       }
 
