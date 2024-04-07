@@ -15,8 +15,6 @@
  *******************************************************************************/
 #include "TPP/Passes.h"
 #include "TPP/Transforms/Transforms.h"
-#include "TPP/Transforms/Utils/EasyBuilder.h"
-#include "TPP/Transforms/Utils/TransformUtils.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -51,9 +49,9 @@ template <typename T> inline T divAndCeil(T a, T b) { return (a - 1) / b + 1; }
 // TODO: Simple TTI interface
 
 MatmulConfig getDefaultMatmulConfig(linalg::MatmulOp &linalgOp) {
-  auto M = linalgOp.getShape(linalgOp.getDpsInputOperand(0))[0],
-       N = linalgOp.getShape(linalgOp.getDpsInputOperand(1))[1],
-       K = linalgOp.getShape(linalgOp.getDpsInputOperand(1))[0];
+  auto M = linalgOp.getShape(linalgOp.getDpsInputOperand(0))[0];
+  auto N = linalgOp.getShape(linalgOp.getDpsInputOperand(1))[1];
+  auto K = linalgOp.getShape(linalgOp.getDpsInputOperand(1))[0];
   MatmulConfig cfg;
 
   // innermost Block
@@ -68,9 +66,9 @@ MatmulConfig getDefaultMatmulConfig(linalg::MatmulOp &linalgOp) {
   auto KNumBlock = K / cfg.innerMostKBlock;
 
   // Threads
-  cfg.MThreads = 1;
-  cfg.NThreads = 1;
-  cfg.KThreads = 3;
+  cfg.MThreads = 2;
+  cfg.NThreads = 2;
+  cfg.KThreads = 2;
 
   // Block
   cfg.MBlock = divAndCeil((int)MNumBlock, cfg.MThreads) * cfg.innerMostMBlock;
@@ -79,7 +77,7 @@ MatmulConfig getDefaultMatmulConfig(linalg::MatmulOp &linalgOp) {
   return cfg;
 }
 
-Value tensorViewRankedTensor(IRRewriter &rewriter,
+Value tensorViewRankedTensor(RewriterBase &rewriter,
                              RankedTensorType outTensorType, Value value) {
   Value result, currentValue = value;
   auto loc = currentValue.getLoc();
@@ -113,7 +111,7 @@ Value tensorViewRankedTensor(IRRewriter &rewriter,
   if (outShape.size() < inShape.size()) {
     SmallVector<ReassociationIndices> reassocIndices;
     ReassociationIndices firstEntry;
-    for (auto i = 0; i < inShape.size() - outShape.size() + 1; i++) {
+    for (auto i = 0UL; i < inShape.size() - outShape.size() + 1; i++) {
       firstEntry.push_back(i);
     }
     reassocIndices.push_back(firstEntry);
@@ -178,13 +176,11 @@ A=ASlice3, B=BSlice3, C=CSlice4, onlyUpdate=(ok!=0));
   C = final_reduce(CSlice)
 }
 */
-struct RewriteMatmulToNestedMatmul
-    : public tpp::impl::RewriteMatmulToNestedMatmulBase<
-          RewriteMatmulToNestedMatmul> {
-  using RewriteMatmulToNestedMatmulBase::RewriteMatmulToNestedMatmulBase;
+struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
+  using OpRewritePattern<linalg::MatmulOp>::OpRewritePattern;
 
   void getMatmulParallelDims(linalg::LinalgOp linalgOp, unsigned operandIdx,
-                             SmallVector<unsigned> &dims) {
+                             SmallVector<unsigned> &dims) const {
     AffineMap map = linalgOp.getMatchingIndexingMap(
         linalgOp.getDpsInputOperand(operandIdx));
     SmallVector<mlir::utils::IteratorType> iteratorTypes =
@@ -201,288 +197,291 @@ struct RewriteMatmulToNestedMatmul
   }
 
   unsigned getOprandDim(linalg::LinalgOp &linalgOp, unsigned iteratorPos,
-                        unsigned operandIdx) {
+                        unsigned operandIdx) const {
     Value Operand;
     unsigned dimPos;
     linalgOp.mapIterationSpaceDimToOperandDim(iteratorPos, Operand, dimPos);
     return linalgOp.getShape(linalgOp.getDpsInputOperand(operandIdx))[dimPos];
   }
 
-  void runOnOperation() override {
-    auto &ctx = getContext();
-    IRRewriter rewriter(&ctx);
-    // Step 1. Recover Named Op
+  LogicalResult matchAndRewrite(linalg::MatmulOp matmulOp,
+                                PatternRewriter &rewriter) const override {
+    if (matmulOp.hasPureBufferSemantics())
+      return failure();
+    MatmulConfig cfg = getDefaultMatmulConfig(matmulOp);
+    linalg::LinalgOp genericOp;
+    bool useBlockedLayout = false;
+    // Step 2. Pack to Mkmk(innerMostMBlock, innerMostKBlock) amd
+    // NKkn(inermostKBlock, innermostNBlock)
     {
-      // Attempt to recover named ops.
-      RewritePatternSet patterns(&ctx);
-      linalg::populateLinalgDeGeneralizationPatterns(patterns);
-      (void)applyPatternsAndFoldGreedily(getOperation(), std::move(patterns));
+      if (useBlockedLayout) {
+        SmallVector<OpFoldResult> packSizes(
+            matmulOp.getNumLoops(),
+            getAsIndexOpFoldResult(rewriter.getContext(), 0));
+        packSizes[0] =
+            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostMBlock);
+        packSizes[1] =
+            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostNBlock);
+        packSizes[2] =
+            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostKBlock);
+        auto linalgOp =
+            mlir::linalgx::packMatmulOp(rewriter, matmulOp, packSizes);
+
+        if (failed(linalgOp))
+          return failure();
+
+        if (linalgOp->hasPureBufferSemantics())
+          return failure();
+        genericOp = *linalgOp;
+      } else {
+        genericOp = dyn_cast<linalg::LinalgOp>(matmulOp.getOperation());
+      }
     }
 
-    getOperation()->walk([&](linalg::MatmulOp matmulOp) {
-      if (matmulOp.hasPureBufferSemantics())
-        return signalPassFailure();
+    // Step 3. The processes of transforming matmul to nested matmul
+    // 3.0 Get the iteration infomation first
+    SmallVector<unsigned> KDimPos, MDimPos, NDimPos;
+    genericOp.getReductionDims(KDimPos);
+    getMatmulParallelDims(genericOp, 0, MDimPos);
+    getMatmulParallelDims(genericOp, 1, NDimPos);
 
-      MatmulConfig cfg = getDefaultMatmulConfig(matmulOp);
-      linalg::LinalgOp genericOp;
-      bool useBlockedLayout = false;
+    // 3.1 Parallel Loop with scf::forall
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(genericOp);
+      SmallVector<OpFoldResult> tiles(
+          genericOp.getNumLoops(),
+          getAsIndexOpFoldResult(rewriter.getContext(), 0));
+      auto MFirstDim = (int)getOprandDim(genericOp, MDimPos[0], 0);
+      auto NFirstDim = (int)getOprandDim(genericOp, NDimPos[0], 1);
+      tiles[MDimPos[0]] = getAsIndexOpFoldResult(
+          rewriter.getContext(),
+          useBlockedLayout
+              ? divAndCeil(MFirstDim, cfg.MThreads)
+              : divAndCeil(divAndCeil(MFirstDim, cfg.MBlock), cfg.MThreads) *
+                    cfg.MBlock);
+      tiles[NDimPos[0]] = getAsIndexOpFoldResult(
+          rewriter.getContext(),
+          useBlockedLayout
+              ? divAndCeil(NFirstDim, cfg.NThreads)
+              : divAndCeil(divAndCeil(NFirstDim, cfg.NBlock), cfg.NThreads) *
+                    cfg.NBlock);
+      auto tilingResult = linalg::tileToForallOpUsingTileSizes(
+          rewriter, cast<TilingInterface>(genericOp.getOperation()), tiles,
+          /*mapping=*/std::nullopt);
+      if (failed(tilingResult))
+        return failure();
+      rewriter.replaceOp(genericOp, tilingResult->tileOp->getResults());
+      genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->tiledOp);
+    }
 
-      // Step 2. Pack to Mkmk(innerMostMBlock, innerMostKBlock) amd
-      // NKkn(inermostKBlock, innermostNBlock)
-      {
-        OpBuilder::InsertionGuard guard(rewriter);
-        if (useBlockedLayout) {
-          SmallVector<OpFoldResult> packSizes(
-              matmulOp.getNumLoops(),
-              getAsIndexOpFoldResult(rewriter.getContext(), 0));
-          packSizes[0] = getAsIndexOpFoldResult(rewriter.getContext(),
-                                                cfg.innerMostMBlock);
-          packSizes[1] = getAsIndexOpFoldResult(rewriter.getContext(),
-                                                cfg.innerMostNBlock);
-          packSizes[2] = getAsIndexOpFoldResult(rewriter.getContext(),
-                                                cfg.innerMostKBlock);
-          rewriter.setInsertionPoint(matmulOp);
-          auto linalgOp =
-              mlir::linalgx::packMatmulOp(rewriter, matmulOp, packSizes);
-
-          if (failed(linalgOp))
-            return signalPassFailure();
-
-          if (linalgOp->hasPureBufferSemantics())
-            return signalPassFailure();
-          genericOp = *linalgOp;
-        } else {
-          genericOp = dyn_cast<linalg::LinalgOp>(matmulOp.getOperation());
-        }
-      }
-
-      // Step 3. The processes of transforming matmul to nested matmul
-      // 3.0 Get the iteration infomation first
-      SmallVector<unsigned> KDimPos, MDimPos, NDimPos;
-      genericOp.getReductionDims(KDimPos);
-      getMatmulParallelDims(genericOp, 0, MDimPos);
-      getMatmulParallelDims(genericOp, 1, NDimPos);
-
-      // 3.1 Parallel Loop with scf::forall
-      {
-        SmallVector<OpFoldResult> tiles(
-            genericOp.getNumLoops(),
-            getAsIndexOpFoldResult(rewriter.getContext(), 0));
-        auto MFirstDim = (int)getOprandDim(genericOp, MDimPos[0], 0);
-        auto NFirstDim = (int)getOprandDim(genericOp, NDimPos[0], 1);
-        tiles[MDimPos[0]] = getAsIndexOpFoldResult(
-            rewriter.getContext(),
-            useBlockedLayout
-                ? divAndCeil(MFirstDim, cfg.MThreads)
-                : divAndCeil(divAndCeil(MFirstDim, cfg.MBlock), cfg.MThreads) *
-                      cfg.MBlock);
-        tiles[NDimPos[0]] = getAsIndexOpFoldResult(
-            rewriter.getContext(),
-            useBlockedLayout
-                ? divAndCeil(NFirstDim, cfg.NThreads)
-                : divAndCeil(divAndCeil(NFirstDim, cfg.NBlock), cfg.NThreads) *
-                      cfg.NBlock);
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPoint(genericOp);
-        auto tilingResult = linalg::tileToForallOpUsingTileSizes(
-            rewriter, cast<TilingInterface>(genericOp.getOperation()), tiles,
-            /*mapping=*/std::nullopt);
-        if (failed(tilingResult))
-          return signalPassFailure();
-        rewriter.replaceOp(genericOp, tilingResult->tileOp->getResults());
-        genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->tiledOp);
-      }
-
-      // 3.2 Tiling reduction parallel loop with scf::forall
-      // TODO: move the reduction dim to the front. (M, N, threads) ->
-      // (threads, M, N)
-      {
-        // TODO: support more than one reduction dim
-        // TODO: move the reduction dim to the front. [M, N, threads] ->
-        // [threads, M, N]
-        if (cfg.KThreads > 1 && !useBlockedLayout) {
-          if (genericOp.hasPureBufferSemantics())
-            return signalPassFailure();
-          auto KFirstDim = (int)getOprandDim(genericOp, KDimPos[0], 1);
-          SmallVector<OpFoldResult> tileSizes(
-              genericOp.getNumLoops(),
-              getAsIndexOpFoldResult(rewriter.getContext(), 0));
-          SmallVector<OpFoldResult> threads(
-              genericOp.getNumLoops(),
-              getAsIndexOpFoldResult(rewriter.getContext(), 0));
-          bool isFirstReductionDim = true;
-          for (auto reductionDim : KDimPos) {
-            if (isFirstReductionDim) {
-              tileSizes[reductionDim] = getAsIndexOpFoldResult(
-                  rewriter.getContext(),
-                  useBlockedLayout
-                      ? divAndCeil(KFirstDim, cfg.KThreads)
-                      : divAndCeil(divAndCeil(KFirstDim, cfg.KBlock),
-                                   cfg.KThreads) *
-                            cfg.KBlock);
-              threads[reductionDim] =
-                  getAsIndexOpFoldResult(rewriter.getContext(), cfg.KThreads);
-              isFirstReductionDim = false;
-            } else {
-              tileSizes[reductionDim] =
-                  getAsIndexOpFoldResult(rewriter.getContext(), 1);
-              threads[reductionDim] =
-                  getAsIndexOpFoldResult(rewriter.getContext(), 1);
-            }
-          }
-
-          rewriter.setInsertionPoint(genericOp);
-          auto tilingResult = linalg::tileReductionUsingForall(
-              rewriter,
-              cast<PartialReductionOpInterface>(genericOp.getOperation()),
-              threads, tileSizes);
-          if (failed(tilingResult))
-            return signalPassFailure();
-          genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->parallelTiledOp);
-          genericOp.getOperation()->getParentOfType<ModuleOp>().dump();
-        }
-      }
-
-      // 3.3 Tiling outer loop with scf::for
-      {
+    // 3.2 Tiling reduction parallel loop with scf::forall
+    // TODO: move the reduction dim to the front. (M, N, threads) ->
+    // (threads, M, N)
+    {
+      // TODO: support more than one reduction dim
+      if (cfg.KThreads > 1 && !useBlockedLayout) {
         if (genericOp.hasPureBufferSemantics())
-          return signalPassFailure();
-        scf::SCFTilingOptions tileOption;
-        SmallVector<OpFoldResult> TileSizes(
+          return failure();
+        auto KFirstDim = (int)getOprandDim(genericOp, KDimPos[0], 1);
+        SmallVector<OpFoldResult> tileSizes(
             genericOp.getNumLoops(),
             getAsIndexOpFoldResult(rewriter.getContext(), 0));
-        if (useBlockedLayout) {
-          TileSizes[MDimPos[0]] = getAsIndexOpFoldResult(
-              rewriter.getContext(),
-              (cfg.MBlock - 1) / cfg.innerMostMBlock + 1);
-          TileSizes[NDimPos[0]] = getAsIndexOpFoldResult(
-              rewriter.getContext(),
-              (cfg.NBlock - 1) / cfg.innerMostNBlock + 1);
-          TileSizes[KDimPos[0]] = getAsIndexOpFoldResult(
-              rewriter.getContext(),
-              (cfg.KBlock - 1) / cfg.innerMostKBlock + 1);
-        } else {
-          TileSizes[MDimPos[0]] =
-              getAsIndexOpFoldResult(rewriter.getContext(), cfg.MBlock);
-          TileSizes[NDimPos[0]] =
-              getAsIndexOpFoldResult(rewriter.getContext(), cfg.NBlock);
-          TileSizes[KDimPos[0]] =
-              getAsIndexOpFoldResult(rewriter.getContext(), cfg.KBlock);
-        }
-
-        tileOption.setTileSizes(TileSizes);
-
-        SmallVector<int64_t> interchange(genericOp.getNumLoops(), 0);
-        for (auto i = 0UL; i < genericOp.getNumLoops(); i++) {
-          interchange[i] = i;
-        }
-        tileOption.setInterchange(interchange);
-
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPoint(genericOp);
-        auto tilingResult = scf::tileUsingSCF(
-            rewriter, cast<TilingInterface>(genericOp.getOperation()),
-            tileOption);
-        if (failed(tilingResult))
-          return signalPassFailure();
-        rewriter.replaceOp(genericOp, tilingResult->replacements);
-        genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->tiledOps.back());
-      }
-
-      // 3.4 Tile innermost loop
-      {
-        // set tile size
-        scf::SCFTilingOptions tileOption;
-        SmallVector<OpFoldResult> TileSizes(
+        SmallVector<OpFoldResult> threads(
             genericOp.getNumLoops(),
             getAsIndexOpFoldResult(rewriter.getContext(), 0));
-        auto iteratorTypes = genericOp.getIteratorTypesArray();
-        TileSizes[MDimPos.back()] =
-            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostMBlock);
-        TileSizes[NDimPos.back()] =
-            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostNBlock);
-        if (!useBlockedLayout) {
-          TileSizes[KDimPos.back()] =
-              getAsIndexOpFoldResult(rewriter.getContext(), cfg.KBlock);
-        }
-        for (auto dim = 0; dim < genericOp.getNumLoops(); dim++) {
-          if (dim != MDimPos.back() && dim != NDimPos.back() &&
-              iteratorTypes[dim] != mlir::utils::IteratorType::reduction) {
-            TileSizes[dim] = getAsIndexOpFoldResult(rewriter.getContext(), 1);
+        bool isFirstReductionDim = true;
+        for (auto reductionDim : KDimPos) {
+          if (isFirstReductionDim) {
+            tileSizes[reductionDim] = getAsIndexOpFoldResult(
+                rewriter.getContext(),
+                useBlockedLayout ? divAndCeil(KFirstDim, cfg.KThreads)
+                                 : divAndCeil(divAndCeil(KFirstDim, cfg.KBlock),
+                                              cfg.KThreads) *
+                                       cfg.KBlock);
+            threads[reductionDim] =
+                getAsIndexOpFoldResult(rewriter.getContext(), cfg.KThreads);
+            isFirstReductionDim = false;
+          } else {
+            tileSizes[reductionDim] =
+                getAsIndexOpFoldResult(rewriter.getContext(), 1);
+            threads[reductionDim] =
+                getAsIndexOpFoldResult(rewriter.getContext(), 1);
           }
         }
-        tileOption.setTileSizes(TileSizes);
 
-        // interchange loop order
-        SmallVector<int64_t> interchange(genericOp.getNumLoops(), 0);
-        for (auto i = 0UL; i < genericOp.getNumLoops(); i++) {
-          interchange[i] = i;
-        }
-        tileOption.setInterchange(interchange);
-
-        // do tiling
         OpBuilder::InsertionGuard guard(rewriter);
         rewriter.setInsertionPoint(genericOp);
-        auto tilingResult = scf::tileUsingSCF(
-            rewriter, cast<TilingInterface>(genericOp.getOperation()),
-            tileOption);
+        auto tilingResult = linalg::tileReductionUsingForall(
+            rewriter,
+            cast<PartialReductionOpInterface>(genericOp.getOperation()),
+            threads, tileSizes);
         if (failed(tilingResult))
-          return signalPassFailure();
-        rewriter.replaceOp(genericOp, tilingResult->replacements);
-        genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->tiledOps.back());
+          return failure();
+        genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->parallelTiledOp);
+      }
+    }
+
+    // 3.3 Tiling outer loop with scf::for
+    {
+      if (genericOp.hasPureBufferSemantics())
+        return failure();
+      scf::SCFTilingOptions tileOption;
+      SmallVector<OpFoldResult> TileSizes(
+          genericOp.getNumLoops(),
+          getAsIndexOpFoldResult(rewriter.getContext(), 0));
+      if (useBlockedLayout) {
+        TileSizes[MDimPos[0]] = getAsIndexOpFoldResult(
+            rewriter.getContext(), (cfg.MBlock - 1) / cfg.innerMostMBlock + 1);
+        TileSizes[NDimPos[0]] = getAsIndexOpFoldResult(
+            rewriter.getContext(), (cfg.NBlock - 1) / cfg.innerMostNBlock + 1);
+        TileSizes[KDimPos[0]] = getAsIndexOpFoldResult(
+            rewriter.getContext(), (cfg.KBlock - 1) / cfg.innerMostKBlock + 1);
+      } else {
+        TileSizes[MDimPos[0]] =
+            getAsIndexOpFoldResult(rewriter.getContext(), cfg.MBlock);
+        TileSizes[NDimPos[0]] =
+            getAsIndexOpFoldResult(rewriter.getContext(), cfg.NBlock);
+        TileSizes[KDimPos[0]] =
+            getAsIndexOpFoldResult(rewriter.getContext(), cfg.KBlock);
       }
 
-      // 3.5 inner loop generation, convert the linalg.generic to brgemm
-      {
-        // TODO: support the strided brgemm which will use two extra copy on
-        // output
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPoint(genericOp);
-        auto dataType = dyn_cast<mlir::RankedTensorType>(
-            genericOp.getDpsInputs()[0].getType());
-        auto weightType = dyn_cast<mlir::RankedTensorType>(
-            genericOp.getDpsInputs()[1].getType());
-        auto resultType = dyn_cast<mlir::RankedTensorType>(
-            genericOp.getDpsInits()[0].getType());
-        Value dataOprand = tensorViewRankedTensor(
-            rewriter,
-            mlir::RankedTensorType::get(
-                useBlockedLayout
-                    ? SmallVector<int64_t>{cfg.KBlock / cfg.innerMostKBlock,
-                                           cfg.innerMostMBlock,
-                                           cfg.innerMostKBlock}
-                    : SmallVector<int64_t>{1, cfg.innerMostMBlock,
-                                           cfg.KBlock / cfg.innerMostKBlock *
-                                               cfg.innerMostKBlock},
-                dataType.getElementType()),
-            genericOp.getDpsInputs()[0]);
-        Value weightOprand = tensorViewRankedTensor(
-            rewriter,
-            mlir::RankedTensorType::get(
-                useBlockedLayout
-                    ? SmallVector<int64_t>{cfg.KBlock / cfg.innerMostKBlock,
-                                           cfg.innerMostKBlock,
-                                           cfg.innerMostNBlock}
-                    : SmallVector<int64_t>{1,
-                                           cfg.KBlock / cfg.innerMostKBlock *
-                                               cfg.innerMostKBlock,
-                                           cfg.innerMostNBlock},
-                weightType.getElementType()),
-            genericOp.getDpsInputs()[1]);
-        Value resultOprand = tensorViewRankedTensor(
-            rewriter,
-            mlir::RankedTensorType::get(
-                SmallVector<int64_t>{cfg.innerMostMBlock, cfg.innerMostNBlock},
-                resultType.getElementType()),
-            genericOp.getDpsInits()[0]);
-        linalg::LinalgOp matmul = rewriter.create<linalg::BatchReduceMatmulOp>(
-            resultOprand.getLoc(), resultOprand.getType(),
-            ValueRange{dataOprand, weightOprand}, resultOprand);
-        Value result = tensorViewRankedTensor(
-            rewriter, resultType, matmul.getOperation()->getResult(0));
-        rewriter.replaceOp(genericOp, result);
+      tileOption.setTileSizes(TileSizes);
+
+      SmallVector<int64_t> interchange(genericOp.getNumLoops(), 0);
+      for (auto i = 0UL; i < genericOp.getNumLoops(); i++) {
+        interchange[i] = i;
       }
-    });
+      tileOption.setInterchange(interchange);
+
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(genericOp);
+      auto tilingResult = scf::tileUsingSCF(
+          rewriter, cast<TilingInterface>(genericOp.getOperation()),
+          tileOption);
+      if (failed(tilingResult))
+        return failure();
+      rewriter.replaceOp(genericOp, tilingResult->replacements);
+      genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->tiledOps.back());
+    }
+
+    // 3.4 Tile innermost loop
+    {
+      // set tile size
+      scf::SCFTilingOptions tileOption;
+      SmallVector<OpFoldResult> TileSizes(
+          genericOp.getNumLoops(),
+          getAsIndexOpFoldResult(rewriter.getContext(), 0));
+      auto iteratorTypes = genericOp.getIteratorTypesArray();
+      TileSizes[MDimPos.back()] =
+          getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostMBlock);
+      TileSizes[NDimPos.back()] =
+          getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostNBlock);
+      if (!useBlockedLayout) {
+        TileSizes[KDimPos.back()] =
+            getAsIndexOpFoldResult(rewriter.getContext(), cfg.KBlock);
+      }
+      for (auto dim = 0; dim < genericOp.getNumLoops(); dim++) {
+        if (dim != MDimPos.back() && dim != NDimPos.back() &&
+            iteratorTypes[dim] != mlir::utils::IteratorType::reduction) {
+          TileSizes[dim] = getAsIndexOpFoldResult(rewriter.getContext(), 1);
+        }
+      }
+      tileOption.setTileSizes(TileSizes);
+
+      // interchange loop order
+      SmallVector<int64_t> interchange(genericOp.getNumLoops(), 0);
+      for (auto i = 0UL; i < genericOp.getNumLoops(); i++) {
+        interchange[i] = i;
+      }
+      tileOption.setInterchange(interchange);
+
+      // do tiling
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(genericOp);
+      auto tilingResult = scf::tileUsingSCF(
+          rewriter, cast<TilingInterface>(genericOp.getOperation()),
+          tileOption);
+      if (failed(tilingResult))
+        return failure();
+      rewriter.replaceOp(genericOp, tilingResult->replacements);
+      genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->tiledOps.back());
+    }
+
+    // 3.5 inner loop generation, convert the linalg.generic to brgemm
+    {
+      // TODO: support the strided brgemm which will use two extra copy on
+      // output
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(genericOp);
+      auto dataType = dyn_cast<mlir::RankedTensorType>(
+          genericOp.getDpsInputs()[0].getType());
+      auto weightType = dyn_cast<mlir::RankedTensorType>(
+          genericOp.getDpsInputs()[1].getType());
+      auto resultType = dyn_cast<mlir::RankedTensorType>(
+          genericOp.getDpsInits()[0].getType());
+      Value dataOprand = tensorViewRankedTensor(
+          rewriter,
+          mlir::RankedTensorType::get(
+              useBlockedLayout
+                  ? SmallVector<int64_t>{cfg.KBlock / cfg.innerMostKBlock,
+                                         cfg.innerMostMBlock,
+                                         cfg.innerMostKBlock}
+                  : SmallVector<int64_t>{1, cfg.innerMostMBlock,
+                                         cfg.KBlock / cfg.innerMostKBlock *
+                                             cfg.innerMostKBlock},
+              dataType.getElementType()),
+          genericOp.getDpsInputs()[0]);
+      Value weightOprand = tensorViewRankedTensor(
+          rewriter,
+          mlir::RankedTensorType::get(
+              useBlockedLayout
+                  ? SmallVector<int64_t>{cfg.KBlock / cfg.innerMostKBlock,
+                                         cfg.innerMostKBlock,
+                                         cfg.innerMostNBlock}
+                  : SmallVector<int64_t>{1,
+                                         cfg.KBlock / cfg.innerMostKBlock *
+                                             cfg.innerMostKBlock,
+                                         cfg.innerMostNBlock},
+              weightType.getElementType()),
+          genericOp.getDpsInputs()[1]);
+      Value resultOprand = tensorViewRankedTensor(
+          rewriter,
+          mlir::RankedTensorType::get(
+              SmallVector<int64_t>{cfg.innerMostMBlock, cfg.innerMostNBlock},
+              resultType.getElementType()),
+          genericOp.getDpsInits()[0]);
+      linalg::LinalgOp matmul = rewriter.create<linalg::BatchReduceMatmulOp>(
+          resultOprand.getLoc(), resultOprand.getType(),
+          ValueRange{dataOprand, weightOprand}, resultOprand);
+      Value result = tensorViewRankedTensor(
+          rewriter, resultType, matmul.getOperation()->getResult(0));
+      rewriter.replaceOp(genericOp, result);
+    }
+    return success();
+  }
+};
+
+struct RewriteMatmulToNestedMatmul
+    : public tpp::impl::RewriteMatmulToNestedMatmulBase<
+          RewriteMatmulToNestedMatmul> {
+  using RewriteMatmulToNestedMatmulBase::RewriteMatmulToNestedMatmulBase;
+
+  void runOnOperation() override {
+    auto &ctx = getContext();
+
+    RewritePatternSet patterns(&ctx);
+
+    // Step 1. Recover Named Op
+    linalg::populateLinalgDeGeneralizationPatterns(patterns);
+
+    // Step 2. Rewrite matmul to nested matmul
+    patterns.add<rewriteToNestedMatmul>(patterns.getContext());
+
+    if (failed(applyPatternsAndFoldGreedily(getOperation(),
+                                            std::move(patterns)))) {
+      return signalPassFailure();
+    }
   }
 };
 
