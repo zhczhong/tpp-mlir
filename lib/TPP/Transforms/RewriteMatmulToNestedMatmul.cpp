@@ -93,7 +93,7 @@ MatmulConfig getDefaultMatmulConfig(linalg::MatmulOp &linalgOp) {
   // Threads
   cfg.MThreads = 2;
   cfg.NThreads = 2;
-  cfg.KThreads = 1;
+  cfg.KThreads = 2;
 
   // Block
   cfg.MBlock = divAndCeil((int)MNumBlock, cfg.MThreads) * cfg.innerMostMBlock;
@@ -537,7 +537,8 @@ tileAllUsingForall(RewriterBase &b, PartialReductionOpInterface op,
     int64_t nonZeroDimIdx = 0;
     for (int64_t i = 0; i < numThreads.size(); ++i) {
       if (llvm::find(redDims, i) != redDims.end()) {
-        resultOffsetsRank.push_back(forallOp.getInductionVars()[nonZeroDimIdx]);
+        resultOffsetsRank.push_back(
+            forallOp.getInductionVars()[nonZeroDimIdx++]);
         resultSizesRank.push_back(b.getIndexAttr(1));
         continue;
       }
@@ -776,8 +777,8 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
                 getAsIndexOpFoldResult(rewriter.getContext(), cfg.KThreads);
             isFirstReductionDim = false;
           } else {
-            tileSizes[reductionDim] =
-                getAsIndexOpFoldResult(rewriter.getContext(), 1);
+            tileSizes[reductionDim] = getAsIndexOpFoldResult(
+                rewriter.getContext(), cfg.innerMostKBlock);
             threads[reductionDim] =
                 getAsIndexOpFoldResult(rewriter.getContext(), 1);
           }
