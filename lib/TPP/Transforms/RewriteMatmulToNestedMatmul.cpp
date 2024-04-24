@@ -93,7 +93,7 @@ MatmulConfig getDefaultMatmulConfig(linalg::MatmulOp &linalgOp) {
   // Threads
   cfg.MThreads = 2;
   cfg.NThreads = 2;
-  cfg.KThreads = 2;
+  cfg.KThreads = 1;
 
   // Block
   cfg.MBlock = divAndCeil((int)MNumBlock, cfg.MThreads) * cfg.innerMostMBlock;
@@ -395,15 +395,25 @@ tileAllUsingForall(RewriterBase &b, PartialReductionOpInterface op,
 
   SmallVector<utils::IteratorType> iterators =
       tilingInterfaceOp.getLoopIteratorTypes();
-  SmallVector<unsigned> redDims;
-  linalgOp.getReductionDims(redDims);
-  if (redDims.size() != 1)
-    return b.notifyMatchFailure(
-        op, "only support ops with one reduction dimension.");
+  SmallVector<int> redDims;
+  for (auto [idx, iteratorType] :
+       llvm::enumerate(tilingInterfaceOp.getLoopIteratorTypes())) {
+    if (iteratorType == utils::IteratorType::reduction)
+      redDims.push_back(idx);
+  }
+  bool hasReductionThreads = false;
+  for (auto dim : redDims) {
+    if (!isConstantIntValue(numThreads[dim], 0) &&
+        !isConstantIntValue(numThreads[dim], 1)) {
+      hasReductionThreads = true;
+      break;
+    }
+  }
+  hasReductionThreads = true;
+
   if (!tileSizes.empty() && tileSizes.size() != numThreads.size())
     return b.notifyMatchFailure(op, "if tile sizes are present it must have as "
                                     "many elements as number of threads");
-  int reductionDim = static_cast<int>(redDims.front());
 
   if (redDims.front() >= numThreads.size())
     return b.notifyMatchFailure(
@@ -411,8 +421,7 @@ tileAllUsingForall(RewriterBase &b, PartialReductionOpInterface op,
 
   // 1. Create the inital tensor value.
   FailureOr<Operation *> identityTensor =
-      op.generateInitialTensorForPartialReduction(b, loc, numThreads,
-                                                  reductionDim);
+      op.generateInitialTensorForPartialReduction(b, loc, numThreads, redDims);
   if (failed(identityTensor))
     return b.notifyMatchFailure(op,
                                 "cannot create a tensor of identity value.");
@@ -434,7 +443,7 @@ tileAllUsingForall(RewriterBase &b, PartialReductionOpInterface op,
   // 2. Create the ForallOp with an empty region.
   scf::ForallOp forallOp = b.create<scf::ForallOp>(
       loc, getAsOpFoldResult(materializedNonZeroNumThreads),
-      (*identityTensor)->getResults(), mapping);
+      hasReductionThreads ? (*identityTensor)->getResults() : dest, mapping);
 
   // 3. Calculate the tile offsets and sizes for the subsequent loop that will
   // be nested under `forallOp`.
@@ -466,7 +475,9 @@ tileAllUsingForall(RewriterBase &b, PartialReductionOpInterface op,
            cast<RankedTensorType>(destBbArgs[destNum].getType()).getShape()) {
         sizes.emplace_back(getAsIndexOpFoldResult(b.getContext(), (int)s));
       }
-      sizes[reductionDim] = b.getIndexAttr(1);
+      for (auto dim : redDims) {
+        sizes[dim] = b.getIndexAttr(1);
+      }
       auto nonZeroDimIdx = 0;
       for (auto dim = 0; dim < numThreads.size(); dim++) {
         if (!isConstantIntValue(numThreads[dim], 0)) {
@@ -547,10 +558,15 @@ tileAllUsingForall(RewriterBase &b, PartialReductionOpInterface op,
   }
 
   // 7. Merge the partial reductions.
+  Operation *mergeOp = nullptr;
   b.setInsertionPointAfter(forallOp);
-  Operation *mergeOp =
-      op.mergeReductions(b, loc, forallOp->getResults(), reductionDim);
-  b.replaceOp(op, mergeOp->getResults());
+  if (hasReductionThreads) {
+    Operation *mergeOp =
+        op.mergeReductions(b, loc, forallOp->getResults(), redDims);
+    b.replaceOp(op, mergeOp->getResults());
+  } else {
+    b.replaceOp(op, forallOp->getResults());
+  }
 
   // 8. Return.
   ForallReductionTilingResult results;
@@ -697,7 +713,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
       return failure();
     MatmulConfig cfg = getDefaultMatmulConfig(matmulOp);
     linalg::LinalgOp genericOp;
-    bool useBlockedLayout = false;
+    bool useBlockedLayout = true;
     // Step 2. Pack to Mkmk(innerMostMBlock, innerMostKBlock) amd
     // NKkn(inermostKBlock, innermostNBlock)
     {
@@ -737,7 +753,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
     // (threads, M, N)
     {
       // TODO: support more than one reduction dim
-      if (cfg.KThreads > 1 && !useBlockedLayout) {
+      if (true || (cfg.KThreads > 1 && !useBlockedLayout)) {
         if (genericOp.hasPureBufferSemantics())
           return failure();
         auto KFirstDim = (int)getOprandDim(genericOp, KDimPos[0], 1);
@@ -798,45 +814,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
       }
     }
 
-    // 3.2 Parallel Loop with scf::forall
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPoint(genericOp);
-      scf::SCFTilingOptions tileOption;
-      SmallVector<OpFoldResult> tiles(
-          genericOp.getNumLoops(),
-          getAsIndexOpFoldResult(rewriter.getContext(), 0));
-      auto MFirstDim = (int)getOprandDim(genericOp, MDimPos[0], 0);
-      auto NFirstDim = (int)getOprandDim(genericOp, NDimPos[0], 1);
-      tiles[MDimPos[0]] = getAsIndexOpFoldResult(
-          rewriter.getContext(),
-          useBlockedLayout
-              ? divAndCeil(MFirstDim, cfg.MThreads)
-              : divAndCeil(divAndCeil(MFirstDim, cfg.MBlock), cfg.MThreads) *
-                    cfg.MBlock);
-      tiles[NDimPos[0]] = getAsIndexOpFoldResult(
-          rewriter.getContext(),
-          useBlockedLayout
-              ? divAndCeil(NFirstDim, cfg.NThreads)
-              : divAndCeil(divAndCeil(NFirstDim, cfg.NBlock), cfg.NThreads) *
-                    cfg.NBlock);
-      tileOption.setTileSizes(tiles);
-
-      SmallVector<int64_t> interchange(genericOp.getNumLoops(), 0);
-      for (auto i = 0UL; i < genericOp.getNumLoops(); i++) {
-        interchange[i] = i;
-      }
-      tileOption.setInterchange(interchange);
-      tileOption.setLoopType(scf::SCFTilingOptions::LoopType::ForallOp);
-
-      auto tilingResult = linalg::tileToForallOpUsingTileSizes(
-          rewriter, cast<TilingInterface>(genericOp.getOperation()), tiles,
-          /*mapping=*/std::nullopt);
-      rewriter.replaceOp(genericOp, tilingResult->tileOp->getResults());
-      genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->tiledOp);
-    }
-
-    // 3.3 Tiling outer loop with scf::for
+    // 3.2 Tiling outer loop with scf::for
     {
       if (genericOp.hasPureBufferSemantics())
         return failure();
@@ -880,7 +858,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
       genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->tiledOps.back());
     }
 
-    // 3.4 Tile innermost loop
+    // 3.3 Tile innermost loop
     {
       // set tile size
       scf::SCFTilingOptions tileOption;
@@ -924,7 +902,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
       genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->tiledOps.back());
     }
 
-    // 3.5 inner loop generation, convert the linalg.generic to brgemm
+    // 3.4 inner loop generation, convert the linalg.generic to brgemm
     {
       // TODO: support the strided brgemm which will use two extra copy on
       // output
@@ -941,7 +919,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
         SmallVector<OpFoldResult> mixedStrides = extractSlice.getMixedStrides();
         SmallVector<int64_t> staticSize =
             useBlockedLayout
-                ? SmallVector<int64_t>{cfg.KBlock / cfg.innerMostKBlock,
+                ? SmallVector<int64_t>{1, cfg.KBlock / cfg.innerMostKBlock,
                                        cfg.innerMostMBlock, cfg.innerMostKBlock}
                 : SmallVector<int64_t>{cfg.innerMostMBlock,
                                        cfg.KBlock / cfg.innerMostKBlock *
@@ -963,7 +941,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
         SmallVector<OpFoldResult> mixedStrides = extractSlice.getMixedStrides();
         SmallVector<int64_t> staticSize =
             useBlockedLayout
-                ? SmallVector<int64_t>{cfg.KBlock / cfg.innerMostKBlock,
+                ? SmallVector<int64_t>{1, cfg.KBlock / cfg.innerMostKBlock,
                                        cfg.innerMostKBlock, cfg.innerMostNBlock}
                 : SmallVector<int64_t>{cfg.KBlock / cfg.innerMostKBlock *
                                            cfg.innerMostKBlock,
@@ -984,7 +962,10 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
         SmallVector<OpFoldResult> mixedSizes = extractSlice.getMixedSizes();
         SmallVector<OpFoldResult> mixedStrides = extractSlice.getMixedStrides();
         SmallVector<int64_t> staticSize =
-            SmallVector<int64_t>{cfg.innerMostMBlock, cfg.innerMostNBlock};
+            useBlockedLayout ? SmallVector<int64_t>{1, 1, cfg.innerMostMBlock,
+                                                    cfg.innerMostNBlock}
+                             : SmallVector<int64_t>{cfg.innerMostMBlock,
+                                                    cfg.innerMostNBlock};
         for (auto i = 0; i < mixedSizes.size(); i++) {
           mixedSizes[i] =
               getAsIndexOpFoldResult(rewriter.getContext(), staticSize[i]);
@@ -1037,16 +1018,31 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
       linalg::LinalgOp matmul = rewriter.create<linalg::BatchReduceMatmulOp>(
           resultOprand.getLoc(), resultOprand.getType(),
           ValueRange{dataOprand, weightOprand}, resultOprand);
-
+      Value result = matmul.getOperation()->getResult(0);
+      matmulOp.getOperation()->getParentOfType<ModuleOp>().dump();
       // Insert the result back to the original tensor
-      auto tensorResults =
-          insertSlicesBack(rewriter, matmul.getLoc(), matmul,
-                           matmul->getOperands(), matmul->getResults());
+      matmulOp.getOperation()->getParentOfType<ModuleOp>().dump();
       for (Operation *user : genericOp->getResult(0).getUsers()) {
         if (isa<tensor::InsertSliceOp>(user)) {
           tensor::InsertSliceOp insertSlice =
               dyn_cast<tensor::InsertSliceOp>(*user);
-          rewriter.replaceOp(insertSlice, tensorResults);
+          SmallVector<OpFoldResult> mixedOffsets =
+              insertSlice.getMixedOffsets();
+          SmallVector<OpFoldResult> mixedSizes = insertSlice.getMixedSizes();
+          SmallVector<OpFoldResult> mixedStrides =
+              insertSlice.getMixedStrides();
+          SmallVector<int64_t> staticSize =
+              useBlockedLayout ? SmallVector<int64_t>{1, 1, cfg.innerMostMBlock,
+                                                      cfg.innerMostNBlock}
+                               : SmallVector<int64_t>{cfg.innerMostMBlock,
+                                                      cfg.innerMostNBlock};
+          for (auto i = 0; i < mixedSizes.size(); i++) {
+            mixedSizes[i] =
+                getAsIndexOpFoldResult(rewriter.getContext(), staticSize[i]);
+          }
+          rewriter.replaceOpWithNewOp<tensor::InsertSliceOp>(
+              insertSlice, result, insertSlice.getDest(), mixedOffsets,
+              mixedSizes, mixedStrides);
         }
       }
       rewriter.replaceOp(genericOp, matmul.getOperation()->getResult(0));
