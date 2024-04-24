@@ -409,7 +409,6 @@ tileAllUsingForall(RewriterBase &b, PartialReductionOpInterface op,
       break;
     }
   }
-  hasReductionThreads = true;
 
   if (!tileSizes.empty() && tileSizes.size() != numThreads.size())
     return b.notifyMatchFailure(op, "if tile sizes are present it must have as "
@@ -420,8 +419,11 @@ tileAllUsingForall(RewriterBase &b, PartialReductionOpInterface op,
         op, "reduction dimension must be mapped to threads");
 
   // 1. Create the inital tensor value.
-  FailureOr<Operation *> identityTensor =
-      op.generateInitialTensorForPartialReduction(b, loc, numThreads, redDims);
+  FailureOr<Operation *> identityTensor = nullptr;
+  if (hasReductionThreads) {
+    identityTensor = op.generateInitialTensorForPartialReduction(
+        b, loc, numThreads, redDims);
+  }
   if (failed(identityTensor))
     return b.notifyMatchFailure(op,
                                 "cannot create a tensor of identity value.");
@@ -464,32 +466,37 @@ tileAllUsingForall(RewriterBase &b, PartialReductionOpInterface op,
 
     SmallVector<Value> tiledDpsInitOperands;
     for (Value initOperand : destinationStyleOp.getDpsInits()) {
-      auto *it = llvm::find(dest, initOperand);
-      assert(it != dest.end() && "dest operand not found in dest");
-      unsigned destNum = std::distance(dest.begin(), it);
-      SmallVector<OpFoldResult> strides(numThreads.size(), b.getIndexAttr(1));
-      SmallVector<OpFoldResult> outOffsets(numThreads.size(),
-                                           b.getIndexAttr(0));
-      SmallVector<OpFoldResult> sizes;
-      for (auto s :
-           cast<RankedTensorType>(destBbArgs[destNum].getType()).getShape()) {
-        sizes.emplace_back(getAsIndexOpFoldResult(b.getContext(), (int)s));
-      }
-      for (auto dim : redDims) {
-        sizes[dim] = b.getIndexAttr(1);
-      }
-      auto nonZeroDimIdx = 0;
-      for (auto dim = 0; dim < numThreads.size(); dim++) {
-        if (!isConstantIntValue(numThreads[dim], 0)) {
-          if (llvm::find(redDims, dim) != redDims.end())
-            outOffsets[dim] = forallOp.getInductionVars()[nonZeroDimIdx];
-          nonZeroDimIdx++;
+      if (hasReductionThreads) {
+        auto *it = llvm::find(dest, initOperand);
+        assert(it != dest.end() && "dest operand not found in dest");
+        unsigned destNum = std::distance(dest.begin(), it);
+        SmallVector<OpFoldResult> strides(numThreads.size(), b.getIndexAttr(1));
+        SmallVector<OpFoldResult> outOffsets(numThreads.size(),
+                                             b.getIndexAttr(0));
+        SmallVector<OpFoldResult> sizes;
+        for (auto s :
+             cast<RankedTensorType>(destBbArgs[destNum].getType()).getShape()) {
+          sizes.emplace_back(getAsIndexOpFoldResult(b.getContext(), (int)s));
         }
+        for (auto dim : redDims) {
+          sizes[dim] = b.getIndexAttr(1);
+        }
+
+        auto nonZeroDimIdx = 0;
+        for (auto dim = 0; dim < numThreads.size(); dim++) {
+          if (!isConstantIntValue(numThreads[dim], 0)) {
+            if (llvm::find(redDims, dim) != redDims.end())
+              outOffsets[dim] = forallOp.getInductionVars()[nonZeroDimIdx];
+            nonZeroDimIdx++;
+          }
+        }
+        // TODO: use SubsetExtractOpInterface once it is available.
+        tiledDpsInitOperands.push_back(b.create<tensor::ExtractSliceOp>(
+            loc, cast<RankedTensorType>(initOperand.getType()),
+            destBbArgs[destNum], outOffsets, sizes, strides));
+      } else {
+        tiledDpsInitOperands.push_back(initOperand);
       }
-      // TODO: use SubsetExtractOpInterface once it is available.
-      tiledDpsInitOperands.push_back(b.create<tensor::ExtractSliceOp>(
-          loc, cast<RankedTensorType>(initOperand.getType()),
-          destBbArgs[destNum], outOffsets, sizes, strides));
     }
 
     // 4.b. Clone the op and update init operands.
@@ -537,9 +544,13 @@ tileAllUsingForall(RewriterBase &b, PartialReductionOpInterface op,
     int64_t nonZeroDimIdx = 0;
     for (int64_t i = 0; i < numThreads.size(); ++i) {
       if (llvm::find(redDims, i) != redDims.end()) {
-        resultOffsetsRank.push_back(
-            forallOp.getInductionVars()[nonZeroDimIdx++]);
-        resultSizesRank.push_back(b.getIndexAttr(1));
+        if (hasReductionThreads) {
+          resultOffsetsRank.push_back(
+              forallOp.getInductionVars()[nonZeroDimIdx++]);
+          resultSizesRank.push_back(b.getIndexAttr(1));
+        } else {
+          nonZeroDimIdx++;
+        }
         continue;
       }
       if (!isConstantIntValue(numThreads[i], 0)) {
@@ -714,7 +725,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
       return failure();
     MatmulConfig cfg = getDefaultMatmulConfig(matmulOp);
     linalg::LinalgOp genericOp;
-    bool useBlockedLayout = true;
+    bool useBlockedLayout = false;
     // Step 2. Pack to Mkmk(innerMostMBlock, innerMostKBlock) amd
     // NKkn(inermostKBlock, innermostNBlock)
     {
@@ -753,66 +764,62 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
     // TODO: move the reduction dim to the front. (M, N, threads) ->
     // (threads, M, N)
     {
-      // TODO: support more than one reduction dim
-      if (true || (cfg.KThreads > 1 && !useBlockedLayout)) {
-        if (genericOp.hasPureBufferSemantics())
-          return failure();
-        auto KFirstDim = (int)getOprandDim(genericOp, KDimPos[0], 1);
-        SmallVector<OpFoldResult> tileSizes(
-            genericOp.getNumLoops(),
-            getAsIndexOpFoldResult(rewriter.getContext(), 0));
-        SmallVector<OpFoldResult> threads(
-            genericOp.getNumLoops(),
-            getAsIndexOpFoldResult(rewriter.getContext(), 0));
-        bool isFirstReductionDim = true;
-        for (auto reductionDim : KDimPos) {
-          if (isFirstReductionDim) {
-            tileSizes[reductionDim] = getAsIndexOpFoldResult(
-                rewriter.getContext(),
-                useBlockedLayout ? divAndCeil(KFirstDim, cfg.KThreads)
-                                 : divAndCeil(divAndCeil(KFirstDim, cfg.KBlock),
-                                              cfg.KThreads) *
-                                       cfg.KBlock);
-            threads[reductionDim] =
-                getAsIndexOpFoldResult(rewriter.getContext(), cfg.KThreads);
-            isFirstReductionDim = false;
-          } else {
-            tileSizes[reductionDim] = getAsIndexOpFoldResult(
-                rewriter.getContext(), cfg.innerMostKBlock);
-            threads[reductionDim] =
-                getAsIndexOpFoldResult(rewriter.getContext(), 1);
-          }
+      if (genericOp.hasPureBufferSemantics())
+        return failure();
+      auto KFirstDim = (int)getOprandDim(genericOp, KDimPos[0], 1);
+      SmallVector<OpFoldResult> tileSizes(
+          genericOp.getNumLoops(),
+          getAsIndexOpFoldResult(rewriter.getContext(), 0));
+      SmallVector<OpFoldResult> threads(
+          genericOp.getNumLoops(),
+          getAsIndexOpFoldResult(rewriter.getContext(), 0));
+      bool isFirstReductionDim = true;
+      for (auto reductionDim : KDimPos) {
+        if (isFirstReductionDim) {
+          tileSizes[reductionDim] = getAsIndexOpFoldResult(
+              rewriter.getContext(),
+              useBlockedLayout ? divAndCeil(KFirstDim, cfg.KThreads)
+                               : divAndCeil(divAndCeil(KFirstDim, cfg.KBlock),
+                                            cfg.KThreads) *
+                                     cfg.KBlock);
+          threads[reductionDim] = getAsIndexOpFoldResult(
+              rewriter.getContext(), cfg.KThreads == 1 ? 0 : cfg.KThreads);
+          isFirstReductionDim = false;
+        } else {
+          tileSizes[reductionDim] = getAsIndexOpFoldResult(
+              rewriter.getContext(), cfg.innerMostKBlock);
+          threads[reductionDim] =
+              getAsIndexOpFoldResult(rewriter.getContext(), 0);
         }
-
-        auto MFirstDim = (int)getOprandDim(genericOp, MDimPos[0], 0);
-        auto NFirstDim = (int)getOprandDim(genericOp, NDimPos[0], 1);
-        threads[MDimPos[0]] =
-            getAsIndexOpFoldResult(rewriter.getContext(), cfg.MThreads);
-        threads[NDimPos[0]] =
-            getAsIndexOpFoldResult(rewriter.getContext(), cfg.NThreads);
-        tileSizes[MDimPos[0]] = getAsIndexOpFoldResult(
-            rewriter.getContext(),
-            useBlockedLayout
-                ? divAndCeil(MFirstDim, cfg.MThreads)
-                : divAndCeil(divAndCeil(MFirstDim, cfg.MBlock), cfg.MThreads) *
-                      cfg.MBlock);
-        tileSizes[NDimPos[0]] = getAsIndexOpFoldResult(
-            rewriter.getContext(),
-            useBlockedLayout
-                ? divAndCeil(NFirstDim, cfg.NThreads)
-                : divAndCeil(divAndCeil(NFirstDim, cfg.NBlock), cfg.NThreads) *
-                      cfg.NBlock);
-
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPoint(genericOp);
-        auto tilingResult = tileAllUsingForall(
-            rewriter,
-            cast<PartialReductionOpInterface>(genericOp.getOperation()),
-            threads, tileSizes, std::nullopt);
-        if (failed(tilingResult))
-          return failure();
-        genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->parallelTiledOp);
       }
+
+      auto MFirstDim = (int)getOprandDim(genericOp, MDimPos[0], 0);
+      auto NFirstDim = (int)getOprandDim(genericOp, NDimPos[0], 1);
+      threads[MDimPos[0]] =
+          getAsIndexOpFoldResult(rewriter.getContext(), cfg.MThreads);
+      threads[NDimPos[0]] =
+          getAsIndexOpFoldResult(rewriter.getContext(), cfg.NThreads);
+      tileSizes[MDimPos[0]] = getAsIndexOpFoldResult(
+          rewriter.getContext(),
+          useBlockedLayout
+              ? divAndCeil(MFirstDim, cfg.MThreads)
+              : divAndCeil(divAndCeil(MFirstDim, cfg.MBlock), cfg.MThreads) *
+                    cfg.MBlock);
+      tileSizes[NDimPos[0]] = getAsIndexOpFoldResult(
+          rewriter.getContext(),
+          useBlockedLayout
+              ? divAndCeil(NFirstDim, cfg.NThreads)
+              : divAndCeil(divAndCeil(NFirstDim, cfg.NBlock), cfg.NThreads) *
+                    cfg.NBlock);
+
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(genericOp);
+      auto tilingResult = tileAllUsingForall(
+          rewriter, cast<PartialReductionOpInterface>(genericOp.getOperation()),
+          threads, tileSizes, std::nullopt);
+      if (failed(tilingResult))
+        return failure();
+      genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->parallelTiledOp);
     }
 
     // 3.2 Tiling outer loop with scf::for
@@ -1020,9 +1027,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
           resultOprand.getLoc(), resultOprand.getType(),
           ValueRange{dataOprand, weightOprand}, resultOprand);
       Value result = matmul.getOperation()->getResult(0);
-      matmulOp.getOperation()->getParentOfType<ModuleOp>().dump();
       // Insert the result back to the original tensor
-      matmulOp.getOperation()->getParentOfType<ModuleOp>().dump();
       for (Operation *user : genericOp->getResult(0).getUsers()) {
         if (isa<tensor::InsertSliceOp>(user)) {
           tensor::InsertSliceOp insertSlice =
