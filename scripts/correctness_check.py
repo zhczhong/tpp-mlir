@@ -18,8 +18,10 @@ func.func @entry() {block_start}
   // Initialize various matrices.
   %da = arith.constant dense<{numpy.array2string(mat_A, separator=", ", max_line_width=100000)}> : tensor<{M}x{K}xf32>
   %db = arith.constant dense<{numpy.array2string(mat_B, separator=", ", max_line_width=100000)}> : tensor<{K}x{N}xf32>
+  %cst_0 = arith.constant 0.000000e+00 : f32
   // Call kernel.
-  %C = arith.constant dense<0.0> : tensor<{M}x{N}xf32>
+  %C_init = tensor.empty():tensor<{M}x{N}xf32>
+  %C = linalg.fill ins(%cst_0 : f32) outs(%C_init : tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32>
   %0 = linalg.matmul ins(%da, %db : tensor<{M}x{K}xf32>, tensor<{K}x{N}xf32>) outs(%C : tensor<{M}x{N}xf32>) -> tensor<{M}x{N}xf32>
   %result = arith.constant dense<{numpy.array2string(mat_C, separator=", ", max_line_width=100000)}> : tensor<{M}x{N}xf32>
   %threshold = arith.constant 0.001: f32

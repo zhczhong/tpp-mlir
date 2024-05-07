@@ -93,7 +93,7 @@ MatmulConfig getDefaultMatmulConfig(linalg::MatmulOp &linalgOp) {
   // Threads
   cfg.MThreads = 2;
   cfg.NThreads = 2;
-  cfg.KThreads = 2;
+  cfg.KThreads = 1;
 
   // Block
   cfg.MBlock = divAndCeil((int)MNumBlock, cfg.MThreads) * cfg.innerMostMBlock;
@@ -728,6 +728,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
     bool useBlockedLayout = false;
     // Step 2. Pack to Mkmk(innerMostMBlock, innerMostKBlock) amd
     // NKkn(inermostKBlock, innermostNBlock)
+    // Todo: remove this step when layout propogation is ready
     {
       if (useBlockedLayout) {
         SmallVector<OpFoldResult> packSizes(
@@ -751,6 +752,19 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
       } else {
         genericOp = dyn_cast<linalg::LinalgOp>(matmulOp.getOperation());
       }
+    }
+
+    // Step 2. Match and remove the init/fill operation
+    // Fuse the fill op manually before fusion support this case(fuse it into
+    // if-else block)
+    bool hasFillOp = false;
+    Value fillValue;
+    SmallVector<LoopLikeOpInterface> KLoopHandle;
+    if (auto op = dyn_cast<linalg::FillOp>(
+            genericOp.getDpsInits()[0].getDefiningOp())) {
+      hasFillOp = true;
+      fillValue = op.getDpsInputs()[0];
+      rewriter.replaceOp(op, op.getDpsInits()[0]);
     }
 
     // Step 3. The processes of transforming matmul to nested matmul
@@ -814,12 +828,28 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
 
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPoint(genericOp);
-      auto tilingResult = tileAllUsingForall(
-          rewriter, cast<PartialReductionOpInterface>(genericOp.getOperation()),
-          threads, tileSizes, std::nullopt);
-      if (failed(tilingResult))
-        return failure();
-      genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->parallelTiledOp);
+      if (auto partialInterface =
+              dyn_cast<PartialReductionOpInterface>(genericOp.getOperation())) {
+        auto tilingResult = tileAllUsingForall(
+            rewriter,
+            cast<PartialReductionOpInterface>(genericOp.getOperation()),
+            threads, tileSizes, std::nullopt);
+        if (failed(tilingResult))
+          return failure();
+        genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->parallelTiledOp);
+      } else if (auto tilingInterface =
+                     cast<TilingInterface>(genericOp.getOperation())) {
+        for (auto reductionDim : KDimPos) {
+          tileSizes[reductionDim] =
+              getAsIndexOpFoldResult(rewriter.getContext(), 0);
+        }
+        auto tilingResult = linalg::tileToForallOpUsingTileSizes(
+            rewriter, tilingInterface, tileSizes, std::nullopt);
+        if (failed(tilingResult))
+          return failure();
+        rewriter.replaceOp(genericOp, tilingResult->tileOp);
+        genericOp = dyn_cast<linalg::LinalgOp>(tilingResult->tiledOp);
+      }
     }
 
     // 3.2 Tiling outer loop with scf::for
@@ -854,7 +884,6 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
       }
       tileOption.setInterchange(interchange);
       tileOption.setLoopType(scf::SCFTilingOptions::LoopType::ForOp);
-
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPoint(genericOp);
       auto tilingResult = scf::tileUsingSCF(
@@ -914,6 +943,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
     {
       // TODO: support the strided brgemm which will use two extra copy on
       // output
+      // TODO: support plain in/block out, block in block out and vnni format
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPoint(genericOp);
 
@@ -1052,6 +1082,20 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
         }
       }
       rewriter.replaceOp(genericOp, matmul.getOperation()->getResult(0));
+      genericOp = matmul;
+    }
+
+    // 3.5 insert fill back
+    {
+      // TODO: support partial K in sinsngle threads
+      auto initOp = genericOp.getDpsInits()[0].getDefiningOp();
+      rewriter.setInsertionPointAfter(genericOp);
+      auto fillOp = rewriter.create<linalg::FillOp>(initOp->getLoc(), fillValue,
+                                                    genericOp.getDpsInits()[0]);
+      IRMapping mapping;
+      mapping.map(genericOp.getDpsInits()[0], fillOp.getResult(0));
+      auto res = rewriter.clone(*(genericOp.getOperation()), mapping);
+      rewriter.replaceOp(genericOp, res);
     }
 
     return success();
@@ -1073,6 +1117,12 @@ struct RewriteMatmulToNestedMatmul
 
     // Step 2. Rewrite matmul to nested matmul
     patterns.add<rewriteToNestedMatmul>(patterns.getContext());
+    linalg::populateLinalgTilingCanonicalizationPatterns(patterns);
+    linalg::ControlDropUnitDims options;
+    options.rankReductionStrategy =
+        linalg::ControlDropUnitDims::RankReductionStrategy::ExtractInsertSlice;
+    linalg::populateFoldUnitExtentDimsPatterns(patterns, options);
+    tensor::populateMergeConsecutiveInsertExtractSlicePatterns(patterns);
 
     if (failed(applyPatternsAndFoldGreedily(getOperation(),
                                             std::move(patterns)))) {
