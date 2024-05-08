@@ -73,7 +73,8 @@ template <typename T> inline T divAndCeil(T a, T b) { return (a - 1) / b + 1; }
 
 // TODO: Simple TTI interface
 
-MatmulConfig getDefaultMatmulConfig(linalg::MatmulOp &linalgOp) {
+template <typename LinalgOpTy>
+MatmulConfig getDefaultMatmulConfig(LinalgOpTy &linalgOp) {
   auto M = linalgOp.getShape(linalgOp.getDpsInputOperand(0))[0];
   auto N = linalgOp.getShape(linalgOp.getDpsInputOperand(1))[1];
   auto K = linalgOp.getShape(linalgOp.getDpsInputOperand(1))[0];
@@ -91,8 +92,8 @@ MatmulConfig getDefaultMatmulConfig(linalg::MatmulOp &linalgOp) {
   auto KNumBlock = K / cfg.innerMostKBlock;
 
   // Threads
-  cfg.MThreads = 2;
-  cfg.NThreads = 2;
+  cfg.MThreads = 1;
+  cfg.NThreads = 1;
   cfg.KThreads = 1;
 
   // Block
@@ -689,8 +690,11 @@ A=ASlice3, B=BSlice3, C=CSlice4, onlyUpdate=(ok!=0));
   C = final_reduce(CSlice)
 }
 */
-struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
-  using OpRewritePattern<linalg::MatmulOp>::OpRewritePattern;
+template <typename LinalgOpTy>
+struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
+  using OpRewritePattern<LinalgOpTy>::OpRewritePattern;
+  static_assert(llvm::is_one_of<LinalgOpTy, linalg::MatmulOp,
+                                linalg::BatchReduceMatmulOp>::value);
 
   void getMatmulParallelDims(linalg::LinalgOp linalgOp, unsigned operandIdx,
                              SmallVector<unsigned> &dims) const {
@@ -717,7 +721,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<linalg::MatmulOp> {
     return linalgOp.getShape(linalgOp.getDpsInputOperand(operandIdx))[dimPos];
   }
 
-  LogicalResult matchAndRewrite(linalg::MatmulOp matmulOp,
+  LogicalResult matchAndRewrite(LinalgOpTy matmulOp,
                                 PatternRewriter &rewriter) const override {
     if (++cnt > 1)
       return failure();
@@ -1116,7 +1120,8 @@ struct RewriteMatmulToNestedMatmul
     linalg::populateLinalgDeGeneralizationPatterns(patterns);
 
     // Step 2. Rewrite matmul to nested matmul
-    patterns.add<rewriteToNestedMatmul>(patterns.getContext());
+    patterns.add<rewriteToNestedMatmul<linalg::MatmulOp>>(
+        patterns.getContext());
     linalg::populateLinalgTilingCanonicalizationPatterns(patterns);
     linalg::ControlDropUnitDims options;
     options.rankReductionStrategy =
