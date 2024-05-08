@@ -547,11 +547,10 @@ tileAllUsingForall(RewriterBase &b, PartialReductionOpInterface op,
       if (llvm::find(redDims, i) != redDims.end()) {
         if (hasReductionThreads) {
           resultOffsetsRank.push_back(
-              forallOp.getInductionVars()[nonZeroDimIdx++]);
+              forallOp.getInductionVars()[nonZeroDimIdx]);
           resultSizesRank.push_back(b.getIndexAttr(1));
-        } else {
-          nonZeroDimIdx++;
         }
+        nonZeroDimIdx++;
         continue;
       }
       if (!isConstantIntValue(numThreads[i], 0)) {
@@ -696,7 +695,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
                                 linalg::BatchMatmulOp>::value);
 
   void getMatmulParallelDims(linalg::LinalgOp linalgOp, unsigned operandIdx,
-                             SmallVector<unsigned> &dims) const {
+                             SmallVectorImpl<unsigned> &dims) const {
     AffineMap map = linalgOp.getMatchingIndexingMap(
         linalgOp.getDpsInputOperand(operandIdx));
     SmallVector<mlir::utils::IteratorType> iteratorTypes =
