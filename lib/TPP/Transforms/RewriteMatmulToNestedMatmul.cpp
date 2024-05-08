@@ -653,7 +653,6 @@ Value tensorViewRankedTensor(RewriterBase &rewriter,
   return result;
 }
 
-static int cnt = 0;
 /*
 forall([PM, PN]: [MThreads, NThreads) {
   for(PK : KThreads) {
@@ -694,7 +693,7 @@ template <typename LinalgOpTy>
 struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
   using OpRewritePattern<LinalgOpTy>::OpRewritePattern;
   static_assert(llvm::is_one_of<LinalgOpTy, linalg::MatmulOp,
-                                linalg::BatchReduceMatmulOp>::value);
+                                linalg::BatchMatmulOp>::value);
 
   void getMatmulParallelDims(linalg::LinalgOp linalgOp, unsigned operandIdx,
                              SmallVector<unsigned> &dims) const {
@@ -723,8 +722,6 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
 
   LogicalResult matchAndRewrite(LinalgOpTy matmulOp,
                                 PatternRewriter &rewriter) const override {
-    if (++cnt > 1)
-      return failure();
     if (matmulOp.hasPureBufferSemantics())
       return failure();
     MatmulConfig cfg = getDefaultMatmulConfig(matmulOp);
@@ -757,6 +754,8 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
         genericOp = dyn_cast<linalg::LinalgOp>(matmulOp.getOperation());
       }
     }
+    if (genericOp.getOperation()->getParentOfType<scf::ForallOp>())
+      return failure();
 
     // Step 2. Match and remove the init/fill operation
     // Fuse the fill op manually before fusion support this case(fuse it into
@@ -1091,7 +1090,8 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
 
     // 3.5 insert fill back
     {
-      // TODO: support partial K in sinsngle threads
+      // TODO: support partial K in sinsngle threads, control flow may need easy
+      // builder support
       auto initOp = genericOp.getDpsInits()[0].getDefiningOp();
       rewriter.setInsertionPointAfter(genericOp);
       auto fillOp = rewriter.create<linalg::FillOp>(initOp->getLoc(), fillValue,
@@ -1120,7 +1120,8 @@ struct RewriteMatmulToNestedMatmul
     linalg::populateLinalgDeGeneralizationPatterns(patterns);
 
     // Step 2. Rewrite matmul to nested matmul
-    patterns.add<rewriteToNestedMatmul<linalg::MatmulOp>>(
+    patterns.add<rewriteToNestedMatmul<linalg::MatmulOp>,
+                 rewriteToNestedMatmul<linalg::BatchMatmulOp>>(
         patterns.getContext());
     linalg::populateLinalgTilingCanonicalizationPatterns(patterns);
     linalg::ControlDropUnitDims options;
