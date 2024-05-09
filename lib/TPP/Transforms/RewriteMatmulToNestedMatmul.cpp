@@ -691,8 +691,9 @@ A=ASlice3, B=BSlice3, C=CSlice4, onlyUpdate=(ok!=0));
 template <typename LinalgOpTy>
 struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
   using OpRewritePattern<LinalgOpTy>::OpRewritePattern;
-  static_assert(llvm::is_one_of<LinalgOpTy, linalg::MatmulOp,
-                                linalg::BatchMatmulOp>::value);
+  static_assert(
+      llvm::is_one_of<LinalgOpTy, linalg::MatmulOp, linalg::BatchMatmulOp,
+                      linalg::GenericOp>::value);
 
   void getMatmulParallelDims(linalg::LinalgOp linalgOp, unsigned operandIdx,
                              SmallVectorImpl<unsigned> &dims) const {
@@ -721,38 +722,12 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
 
   LogicalResult matchAndRewrite(LinalgOpTy matmulOp,
                                 PatternRewriter &rewriter) const override {
+    static int cnt = 0;
     if (matmulOp.hasPureBufferSemantics())
       return failure();
     MatmulConfig cfg = getDefaultMatmulConfig(matmulOp);
     linalg::LinalgOp genericOp;
-    bool useBlockedLayout = false;
-    // Step 2. Pack to Mkmk(innerMostMBlock, innerMostKBlock) amd
-    // NKkn(inermostKBlock, innermostNBlock)
-    // Todo: remove this step when layout propogation is ready
-    {
-      if (useBlockedLayout) {
-        SmallVector<OpFoldResult> packSizes(
-            matmulOp.getNumLoops(),
-            getAsIndexOpFoldResult(rewriter.getContext(), 0));
-        packSizes[0] =
-            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostMBlock);
-        packSizes[1] =
-            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostNBlock);
-        packSizes[2] =
-            getAsIndexOpFoldResult(rewriter.getContext(), cfg.innerMostKBlock);
-        auto linalgOp =
-            mlir::linalgx::packMatmulOp(rewriter, matmulOp, packSizes);
-
-        if (failed(linalgOp))
-          return failure();
-
-        if (linalgOp->hasPureBufferSemantics())
-          return failure();
-        genericOp = *linalgOp;
-      } else {
-        genericOp = dyn_cast<linalg::LinalgOp>(matmulOp.getOperation());
-      }
-    }
+    genericOp = dyn_cast<linalg::LinalgOp>(matmulOp.getOperation());
     if (genericOp.getOperation()->getParentOfType<scf::ForallOp>())
       return failure();
 
@@ -775,6 +750,7 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
     genericOp.getReductionDims(KDimPos);
     getMatmulParallelDims(genericOp, 0, MDimPos);
     getMatmulParallelDims(genericOp, 1, NDimPos);
+    bool useBlockedLayout = KDimPos.size() > 1;
 
     // 3.1 Tiling reduction parallel loop with scf::forall
     // TODO: move the reduction dim to the front. (M, N, threads) ->
@@ -942,13 +918,13 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
     }
 
     // 3.4 inner loop generation, convert the linalg.generic to brgemm
-    {
+    if (KDimPos.size() == 1) {
+      genericOp.getOperation()->getParentOfType<func::FuncOp>().dump();
       // TODO: support the strided brgemm which will use two extra copy on
       // output
       // TODO: support plain in/block out, block in block out and vnni format
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPoint(genericOp);
-
       // update the extractSlice to static size
       if (isa<tensor::ExtractSliceOp>(
               genericOp.getDpsInputs()[0].getDefiningOp())) {
@@ -1020,7 +996,6 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
           genericOp.getDpsInputs()[1].getType());
       auto resultType = dyn_cast<mlir::RankedTensorType>(
           genericOp.getDpsInits()[0].getType());
-
       // View the tensor to brgemm required format
       Value dataOprand = tensorViewRankedTensor(
           rewriter,
@@ -1120,7 +1095,8 @@ struct RewriteMatmulToNestedMatmul
 
     // Step 2. Rewrite matmul to nested matmul
     patterns.add<rewriteToNestedMatmul<linalg::MatmulOp>,
-                 rewriteToNestedMatmul<linalg::BatchMatmulOp>>(
+                 rewriteToNestedMatmul<linalg::BatchMatmulOp>,
+                 rewriteToNestedMatmul<linalg::GenericOp>>(
         patterns.getContext());
     linalg::populateLinalgTilingCanonicalizationPatterns(patterns);
     linalg::ControlDropUnitDims options;
