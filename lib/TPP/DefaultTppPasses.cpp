@@ -14,6 +14,7 @@
 #include "mlir/InitAllPasses.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include <iostream>
 
 #include "TPP/Dialect/Check/BufferizableOpInterfaceImpl.h"
 #include "TPP/Dialect/Check/CheckDialect.h"
@@ -111,15 +112,14 @@ private:
     pm.addNestedPass<func::FuncOp>(createCleanup());
 
     mlir::tpp::SCFParallelLoopTilingOptions tilingOptions;
-    tilingOptions.tileSizes = parallelTaskGrid;
-    pm.addPass(createSCFParallelLoopTiling(tilingOptions));
+    // tilingOptions.tileSizes = parallelTaskGrid;
+    // pm.addPass(createSCFParallelLoopTiling(tilingOptions));
 
     pm.addNestedPass<func::FuncOp>(createIntelAMXTileConfigInsertionPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createLoopInvariantCodeMotionPass());
     pm.addNestedPass<func::FuncOp>(createCanonicalizerPass());
     pm.addNestedPass<func::FuncOp>(createIntelAMXTileConfigHoistingPass());
-
     pm.addPass(createConvertXsmmToFunc());
     pm.addPass(createConvertPerfToFunc());
   }
@@ -213,6 +213,8 @@ private:
     // Run only canonicalizer at this stage as full cleanup (mostly CSE) can
     // mess up tensor producer-consumer chains used for analysis in the
     // following passes.
+    pm.addPass(createRewriteMatmulToNestedMatmul());
+    pm.addPass(createPrintIRPass());
     pm.addPass(createPropagatePackUnPack());
     pm.addPass(createConstantFoldPack());
     pm.addPass(createSimplifyAndCanonicalizePack());
@@ -221,6 +223,7 @@ private:
     pm.addPass(createTileConsumerAndFuseProducers());
     pm.addPass(createSimplifyAndCanonicalizePack());
     pm.addPass(createCleanup());
+    pm.addPass(createPrintIRPass());
   }
 };
 
@@ -242,7 +245,6 @@ struct LinalgLowering : public tpp::impl::LinalgLoweringBase<LinalgLowering>,
 private:
   void constructPipeline() override {
     pm.clear();
-
     pm.addPass(createConvertLinalgToXsmm());
     pm.addPass(createCombineXsmmOpPass());
     pm.addPass(createFoldXsmmFlags());
@@ -301,19 +303,15 @@ private:
 
       // Applies a set of passes at the linalg level to fuse and pack.
       pm.addPass(createTppMapping());
-
       // Generalize tensor.pack and tensor.unpack.
       pm.addPass(createLowerPacksAndUnPacks());
       pm.addNestedPass<func::FuncOp>(createCleanup());
-
       // Decompose Aggregated operations. These ops currently do not
       // bufferize. Once this is possible we can move this pass after
       // bufferization.
       pm.addNestedPass<func::FuncOp>(createDecomposeAggregatedOps());
-
       // Bufferize: tensor->memref.
       pm.addPass(createBufferize());
-
       // Lower all Tile operations.
       pm.addNestedPass<func::FuncOp>(createLinalgLowering());
       pm.addNestedPass<func::FuncOp>(createCleanup());
@@ -321,14 +319,16 @@ private:
 
     // Convert forAll to parallel loops should run after bufferization
     // as scf.parallel does not handle tensor.
+    pm.addPass(createPrintIRPass());
     pm.addPass(createConvertForAllToParallelOp());
-
+    
     // Covert all local TPP-related dialects.
     LocalDialectsLoweringOptions localDialectsLowering{parallelTaskGrid};
     pm.addPass(createLocalDialectsLowering(localDialectsLowering));
 
     // Clean up after the default pipeline.
     pm.addNestedPass<func::FuncOp>(createPostprocessing());
+    pm.addPass(createTileConsumerAndFuseProducers());
   }
 };
 
