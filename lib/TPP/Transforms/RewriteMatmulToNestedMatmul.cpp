@@ -344,7 +344,6 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
 
   LogicalResult matchAndRewrite(LinalgOpTy matmulOp,
                                 PatternRewriter &rewriter) const override {
-    static int cnt = 0;
     if (matmulOp.hasPureBufferSemantics())
       return failure();
     MatmulConfig cfg = getDefaultMatmulConfig(matmulOp);
@@ -356,15 +355,15 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
     // Step 2. Match and remove the init/fill operation
     // Fuse the fill op manually before fusion support this case(fuse it into
     // if-else block)
-    // bool hasFillOp = false;
-    // Value fillValue;
-    // SmallVector<LoopLikeOpInterface> KLoopHandle;
-    // if (auto op = dyn_cast<linalg::FillOp>(
-    //         genericOp.getDpsInits()[0].getDefiningOp())) {
-    //   hasFillOp = true;
-    //   fillValue = op.getDpsInputs()[0];
-    //   rewriter.replaceOp(op, op.getDpsInits()[0]);
-    // }
+    bool hasFillOp = false;
+    Value fillValue;
+    SmallVector<LoopLikeOpInterface> KLoopHandle;
+    if (auto op = dyn_cast<linalg::FillOp>(
+            genericOp.getDpsInits()[0].getDefiningOp())) {
+      hasFillOp = true;
+      fillValue = op.getDpsInputs()[0];
+      rewriter.replaceOp(op, op.getDpsInits()[0]);
+    }
 
     // Step 3. The processes of transforming matmul to nested matmul
     // 3.0 Get the iteration infomation first
@@ -447,7 +446,6 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
 
     // 3.2 inner loop generation, convert the linalg.generic to brgemm
     if (KDimPos.size() == 1) {
-      genericOp.getOperation()->getParentOfType<func::FuncOp>().dump();
       // TODO: support the strided brgemm which will use two extra copy on
       // output
       // TODO: support plain in/block out, block in block out and vnni format
@@ -591,20 +589,17 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
     }
 
     // 3.5 insert fill back
-    // {
-    //   // TODO: support partial K in sinsngle threads, control flow may need
-    //   easy
-    //   // builder support
-    //   auto initOp = genericOp.getDpsInits()[0].getDefiningOp();
-    //   rewriter.setInsertionPointAfter(genericOp);
-    //   auto fillOp = rewriter.create<linalg::FillOp>(initOp->getLoc(),
-    //   fillValue,
-    //                                                 genericOp.getDpsInits()[0]);
-    //   IRMapping mapping;
-    //   mapping.map(genericOp.getDpsInits()[0], fillOp.getResult(0));
-    //   auto res = rewriter.clone(*(genericOp.getOperation()), mapping);
-    //   rewriter.replaceOp(genericOp, res);
-    // }
+    if (hasFillOp) {
+      // TODO: support partial K in sinsngle threads, control flow may need
+      // easy builder support
+      rewriter.setInsertionPointAfter(genericOp);
+      auto fillOp = rewriter.create<linalg::FillOp>(
+          genericOp->getLoc(), fillValue, genericOp.getDpsInits()[0]);
+      IRMapping mapping;
+      mapping.map(genericOp.getDpsInits()[0], fillOp.getResult(0));
+      auto res = rewriter.clone(*(genericOp.getOperation()), mapping);
+      rewriter.replaceOp(genericOp, res);
+    }
     return success();
   }
 };
