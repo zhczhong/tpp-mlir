@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *******************************************************************************/
+
 #include "TPP/Passes.h"
 #include "TPP/Transforms/Transforms.h"
 #include "mlir/AsmParser/AsmParser.h"
@@ -71,7 +72,7 @@ MatmulConfig getDefaultMatmulConfig(LinalgOpTy &linalgOp) {
   auto KNumBlock = K / cfg.innerMostKBlock;
 
   // Threads
-  cfg.MThreads = 1;
+  cfg.MThreads = 32;
   cfg.NThreads = 1;
   cfg.KThreads = 1;
 
@@ -80,15 +81,15 @@ MatmulConfig getDefaultMatmulConfig(LinalgOpTy &linalgOp) {
   cfg.NBlock = divAndCeil((int)NNumBlock, cfg.NThreads) * cfg.innerMostNBlock;
   cfg.KBlock = divAndCeil((int)KNumBlock, cfg.KThreads) * cfg.innerMostKBlock;
 
-  // cfg.innerMostMBlock = 32;
-  // cfg.innerMostNBlock = 32;
-  // cfg.innerMostKBlock = 32;
-  // cfg.MBlock = 64;
-  // cfg.NBlock = 64;
-  // cfg.KBlock = 64;
-  // cfg.MThreads = 2;
-  // cfg.NThreads = 2;
-  // cfg.KThreads = 1;
+  cfg.innerMostMBlock = 32;
+  cfg.innerMostNBlock = 32;
+  cfg.innerMostKBlock = 32;
+  cfg.MBlock = 64;
+  cfg.NBlock = 64;
+  cfg.KBlock = 64;
+  cfg.MThreads = 8;
+  cfg.NThreads = 1;
+  cfg.KThreads = 1;
   return cfg;
 }
 
@@ -130,22 +131,22 @@ Value tensorViewRankedTensor(RewriterBase &rewriter,
       firstEntry.push_back(i);
     }
     reassocIndices.push_back(firstEntry);
-    for (auto i = inShape.size() - outShape.size() + 1; i < inShape.size();
+    for (auto i = inShape.size() - outShape.size() + 1UL; i < inShape.size();
          i++) {
-      reassocIndices.push_back({i});
+      reassocIndices.push_back({(int)i});
     }
     result = rewriter.create<tensor::CollapseShapeOp>(
         loc, outTensorType, currentValue, reassocIndices);
   } else if (outShape.size() > inShape.size()) {
     SmallVector<ReassociationIndices> reassocIndices;
     ReassociationIndices firstEntry;
-    for (auto i = 0; i < outShape.size() - inShape.size() + 1; i++) {
-      firstEntry.push_back(i);
+    for (auto i = 0UL; i < outShape.size() - inShape.size() + 1; i++) {
+      firstEntry.push_back((int)i);
     }
     reassocIndices.push_back(firstEntry);
-    for (auto i = outShape.size() - inShape.size() + 1; i < outShape.size();
+    for (auto i = outShape.size() - inShape.size() + 1UL; i < outShape.size();
          i++) {
-      reassocIndices.push_back({i});
+      reassocIndices.push_back({(int)i});
     }
     result = rewriter.create<tensor::ExpandShapeOp>(
         loc, outTensorType, currentValue, reassocIndices);
@@ -317,6 +318,8 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
       llvm::is_one_of<LinalgOpTy, linalg::MatmulOp, linalg::BatchMatmulOp,
                       linalg::GenericOp>::value);
 
+  enum DimType { Batch, M, N, K };
+
   void getMatmulParallelDims(linalg::LinalgOp linalgOp, unsigned operandIdx,
                              SmallVectorImpl<unsigned> &dims) const {
     AffineMap map = linalgOp.getMatchingIndexingMap(
@@ -340,6 +343,66 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
     unsigned dimPos;
     linalgOp.mapIterationSpaceDimToOperandDim(iteratorPos, Operand, dimPos);
     return linalgOp.getShape(linalgOp.getDpsInputOperand(operandIdx))[dimPos];
+  }
+
+  FailureOr<SmallVector<SmallVector<DimType>>>
+  getOprandDimType(linalg::LinalgOp &linalgOp) const {
+    if (isa<linalg::MatmulOp>(linalgOp)) {
+      return SmallVector<SmallVector<DimType>>{
+          SmallVector<DimType>{DimType::M, DimType::K},
+          SmallVector<DimType>{DimType::K, DimType::N},
+          SmallVector<DimType>{DimType::M, DimType::N}};
+    } else if (isa<linalg::GenericOp>(linalgOp)) {
+      auto iteratorTypes = linalgOp.getIteratorTypesArray();
+      if (iteratorTypes.size() == 7UL) {
+        // 4Dx5D, brgemm vnni
+        return SmallVector<SmallVector<DimType>>{
+            SmallVector<DimType>{DimType::M, DimType::K, DimType::M,
+                                 DimType::K},
+            SmallVector<DimType>{DimType::N, DimType::K, DimType::K, DimType::N,
+                                 DimType::K},
+            SmallVector<DimType>{DimType::M, DimType::N, DimType::M,
+                                 DimType::N}};
+      } else if (iteratorTypes.size() == 6UL) {
+        // 4Dx4D
+        return SmallVector<SmallVector<DimType>>{
+            SmallVector<DimType>{DimType::M, DimType::K, DimType::M,
+                                 DimType::K},
+            SmallVector<DimType>{DimType::N, DimType::K, DimType::K,
+                                 DimType::N},
+            SmallVector<DimType>{DimType::M, DimType::N, DimType::M,
+                                 DimType::N}};
+      }
+    } else {
+      // auto oprand = operandIdx < 2 ? linalgOp.getDpsInputOperand(operandIdx)
+      //                              : linalgOp.getDpsInitOperand(operandIdx -
+      //                              2);
+      // AffineMap map = linalgOp.getMatchingIndexingMap(oprand);
+      // SmallVector<mlir::utils::IteratorType> iteratorTypes =
+      //     linalgOp.getIteratorTypesArray();
+      // ArrayRef<AffineExpr> oprandDimPos = map.getResults();
+      // for (auto dim : oprandDimPos) {
+      //   auto dimExpr = dyn_cast<AffineDimExpr>(dim);
+      //   SmallVector<std::pair<Value, unsigned>> oprandDimPairs;
+      //   linalgOp.mapIterationSpaceDimToAllOperandDims(dimExpr.getPosition(),
+      //                                                 oprandDimPairs);
+      //   if (dimExpr && iteratorTypes[dimExpr.getPosition()] ==
+      //                      mlir::utils::IteratorType::parallel) {
+      //     if (oprandDimPairs.size() == 2UL) {
+      //       // A/B, C have it
+      //       ret.push_back(DimType::Parallel);
+      //     } else if (oprandDimPairs.size() == 3UL) {
+      //       // A, B, C all have it
+      //       ret.push_back(DimType::Batch);
+      //     }
+      //   } else if (dimExpr && iteratorTypes[dimExpr.getPosition()] ==
+      //                             mlir::utils::IteratorType::reduction) {
+      //     ret.push_back(DimType::Reduction);
+      //   }
+      // }
+      return failure();
+    }
+    return failure();
   }
 
   LogicalResult matchAndRewrite(LinalgOpTy matmulOp,
@@ -368,6 +431,11 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
     // Step 3. The processes of transforming matmul to nested matmul
     // 3.0 Get the iteration infomation first
     SmallVector<unsigned> KDimPos, MDimPos, NDimPos;
+    auto operandDimTypes = getOprandDimType(genericOp);
+    auto AShape = genericOp.getShape(genericOp.getDpsInputOperand(0));
+    auto BShape = genericOp.getShape(genericOp.getDpsInputOperand(1));
+    auto CShape = genericOp.getShape(genericOp.getDpsInitOperand(0));
+
     genericOp.getReductionDims(KDimPos);
     getMatmulParallelDims(genericOp, 0, MDimPos);
     getMatmulParallelDims(genericOp, 1, NDimPos);
@@ -429,15 +497,15 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
         option.nestedTileSizes.emplace_back(SmallVector<int>{cfg.KBlock});
         option.loopType.emplace_back(
             OuterLoopGenerationOption::LoopType::ForOp);
-        option.loopDim.emplace_back(SmallVector<int>{KDimPos.back()});
+        option.loopDim.emplace_back(SmallVector<int>{(int)KDimPos.back()});
       }
-      for (auto dim = 0; dim < genericOp.getNumLoops(); dim++) {
+      for (auto dim = 0UL; dim < genericOp.getNumLoops(); dim++) {
         if (dim != MDimPos.back() && dim != NDimPos.back() &&
             iteratorTypes[dim] != mlir::utils::IteratorType::reduction) {
           option.nestedTileSizes.emplace_back(SmallVector<int>{1});
           option.loopType.emplace_back(
               OuterLoopGenerationOption::LoopType::ForOp);
-          option.loopDim.emplace_back(SmallVector<int>{dim});
+          option.loopDim.emplace_back(SmallVector<int>{(int)dim});
         }
       }
       auto tilingResult = generateOuterLoop(rewriter, genericOp, option);
@@ -445,12 +513,76 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
     }
 
     // 3.2 inner loop generation, convert the linalg.generic to brgemm
-    if (KDimPos.size() == 1) {
+    {
       // TODO: support the strided brgemm which will use two extra copy on
       // output
       // TODO: support plain in/block out, block in block out and vnni format
+      SmallVector<int64_t> AInnermostDims, BInnermostDims, CInnermostDims;
+      if (useBlockedLayout) {
+        bool firstM = true, firstK = true, firstN = true;
+        for (auto [idx, iter] : llvm::enumerate((*operandDimTypes)[0])) {
+          if (iter == DimType::M && firstM) {
+            AInnermostDims.push_back(1);
+            firstM = false;
+          } else if (iter == DimType::Batch) {
+            AInnermostDims.push_back(1);
+          } else if (iter == DimType::K && firstK) {
+            AInnermostDims.push_back(cfg.KBlock / cfg.innerMostKBlock);
+            firstK = false;
+          } else {
+            AInnermostDims.push_back(AShape[idx]);
+          }
+        }
+        firstN = true;
+        firstK = true;
+        for (auto [idx, iter] : llvm::enumerate((*operandDimTypes)[1])) {
+          if (iter == DimType::N && firstN) {
+            BInnermostDims.push_back(1);
+            firstN = false;
+          } else if (iter == DimType::Batch) {
+            BInnermostDims.push_back(1);
+          } else if (iter == DimType::K && firstK) {
+            BInnermostDims.push_back(cfg.KBlock / cfg.innerMostKBlock);
+            firstK = false;
+          } else {
+            BInnermostDims.push_back(BShape[idx]);
+          }
+        }
+        firstM = true;
+        firstN = true;
+        for (auto [idx, iter] : llvm::enumerate((*operandDimTypes)[2])) {
+          if (iter == DimType::M && firstM) {
+            CInnermostDims.push_back(1);
+            firstM = false;
+          } else if (iter == DimType::Batch) {
+            CInnermostDims.push_back(1);
+          } else if (iter == DimType::N && firstN) {
+            CInnermostDims.push_back(1);
+            firstN = false;
+          } else {
+            CInnermostDims.push_back(CShape[idx]);
+          }
+        }
+      } else {
+        AInnermostDims =
+            SmallVector<int64_t>{cfg.innerMostMBlock, cfg.innerMostKBlock};
+        BInnermostDims = SmallVector<int64_t>{cfg.KBlock / cfg.innerMostKBlock *
+                                                  cfg.innerMostKBlock,
+                                              cfg.innerMostNBlock};
+        CInnermostDims =
+            SmallVector<int64_t>{cfg.innerMostMBlock, cfg.innerMostNBlock};
+      }
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPoint(genericOp);
+      auto dataType = dyn_cast<mlir::RankedTensorType>(
+          genericOp.getDpsInputs()[0].getType());
+      auto weightType = dyn_cast<mlir::RankedTensorType>(
+          genericOp.getDpsInputs()[1].getType());
+      auto resultType = dyn_cast<mlir::RankedTensorType>(
+          genericOp.getDpsInits()[0].getType());
+      // use shrink layout when it is able to be converted to brgemm
+      bool useShrinkedLayout =
+          (BInnermostDims.size() == 4 || BInnermostDims.size() == 2);
       // update the extractSlice to static size
       if (isa<tensor::ExtractSliceOp>(
               genericOp.getDpsInputs()[0].getDefiningOp())) {
@@ -459,20 +591,28 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
         SmallVector<OpFoldResult> mixedOffsets = extractSlice.getMixedOffsets();
         SmallVector<OpFoldResult> mixedSizes = extractSlice.getMixedSizes();
         SmallVector<OpFoldResult> mixedStrides = extractSlice.getMixedStrides();
-        SmallVector<int64_t> staticSize =
-            useBlockedLayout
-                ? SmallVector<int64_t>{1, cfg.KBlock / cfg.innerMostKBlock,
-                                       cfg.innerMostMBlock, cfg.innerMostKBlock}
-                : SmallVector<int64_t>{cfg.innerMostMBlock,
-                                       cfg.KBlock / cfg.innerMostKBlock *
-                                           cfg.innerMostKBlock};
-        for (auto i = 0; i < mixedSizes.size(); i++) {
+        SmallVector<int64_t> staticSize = AInnermostDims;
+        for (auto i = 0UL; i < mixedSizes.size(); i++) {
           mixedSizes[i] =
               getAsIndexOpFoldResult(rewriter.getContext(), staticSize[i]);
         }
-        rewriter.replaceOpWithNewOp<tensor::ExtractSliceOp>(
-            extractSlice, extractSlice.getSource(), mixedOffsets, mixedSizes,
-            mixedStrides);
+        if (useShrinkedLayout) {
+          rewriter.replaceOpWithNewOp<tensor::ExtractSliceOp>(
+              extractSlice,
+              mlir::RankedTensorType::get(
+                  useBlockedLayout
+                      ? SmallVector<int64_t>(AInnermostDims.begin() + 1,
+                                             AInnermostDims.end())
+                      : SmallVector<int64_t>{1, cfg.innerMostMBlock,
+                                             cfg.KBlock / cfg.innerMostKBlock *
+                                                 cfg.innerMostKBlock},
+                  dataType.getElementType()),
+              extractSlice.getSource(), mixedOffsets, mixedSizes, mixedStrides);
+        } else {
+          rewriter.replaceOpWithNewOp<tensor::ExtractSliceOp>(
+              extractSlice, extractSlice.getSource(), mixedOffsets, mixedSizes,
+              mixedStrides);
+        }
       }
       if (isa<tensor::ExtractSliceOp>(
               genericOp.getDpsInputs()[1].getDefiningOp())) {
@@ -481,20 +621,29 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
         SmallVector<OpFoldResult> mixedOffsets = extractSlice.getMixedOffsets();
         SmallVector<OpFoldResult> mixedSizes = extractSlice.getMixedSizes();
         SmallVector<OpFoldResult> mixedStrides = extractSlice.getMixedStrides();
-        SmallVector<int64_t> staticSize =
-            useBlockedLayout
-                ? SmallVector<int64_t>{1, cfg.KBlock / cfg.innerMostKBlock,
-                                       cfg.innerMostKBlock, cfg.innerMostNBlock}
-                : SmallVector<int64_t>{cfg.KBlock / cfg.innerMostKBlock *
-                                           cfg.innerMostKBlock,
-                                       cfg.innerMostNBlock};
-        for (auto i = 0; i < mixedSizes.size(); i++) {
+        SmallVector<int64_t> staticSize = BInnermostDims;
+        for (auto i = 0UL; i < mixedSizes.size(); i++) {
           mixedSizes[i] =
               getAsIndexOpFoldResult(rewriter.getContext(), staticSize[i]);
         }
-        rewriter.replaceOpWithNewOp<tensor::ExtractSliceOp>(
-            extractSlice, extractSlice.getSource(), mixedOffsets, mixedSizes,
-            mixedStrides);
+        if (useShrinkedLayout) {
+          rewriter.replaceOpWithNewOp<tensor::ExtractSliceOp>(
+              extractSlice,
+              mlir::RankedTensorType::get(
+                  useBlockedLayout
+                      ? SmallVector<int64_t>(BInnermostDims.begin() + 1,
+                                             BInnermostDims.end())
+                      : SmallVector<int64_t>{1,
+                                             cfg.KBlock / cfg.innerMostKBlock *
+                                                 cfg.innerMostKBlock,
+                                             cfg.innerMostNBlock},
+                  weightType.getElementType()),
+              extractSlice.getSource(), mixedOffsets, mixedSizes, mixedStrides);
+        } else {
+          rewriter.replaceOpWithNewOp<tensor::ExtractSliceOp>(
+              extractSlice, extractSlice.getSource(), mixedOffsets, mixedSizes,
+              mixedStrides);
+        }
       }
       if (isa<tensor::ExtractSliceOp>(
               genericOp.getDpsInits()[0].getDefiningOp())) {
@@ -503,33 +652,32 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
         SmallVector<OpFoldResult> mixedOffsets = extractSlice.getMixedOffsets();
         SmallVector<OpFoldResult> mixedSizes = extractSlice.getMixedSizes();
         SmallVector<OpFoldResult> mixedStrides = extractSlice.getMixedStrides();
-        SmallVector<int64_t> staticSize =
-            useBlockedLayout ? SmallVector<int64_t>{1, 1, cfg.innerMostMBlock,
-                                                    cfg.innerMostNBlock}
-                             : SmallVector<int64_t>{cfg.innerMostMBlock,
-                                                    cfg.innerMostNBlock};
-        for (auto i = 0; i < mixedSizes.size(); i++) {
+        SmallVector<int64_t> staticSize = CInnermostDims;
+        for (auto i = 0UL; i < mixedSizes.size(); i++) {
           mixedSizes[i] =
               getAsIndexOpFoldResult(rewriter.getContext(), staticSize[i]);
         }
-        rewriter.replaceOpWithNewOp<tensor::ExtractSliceOp>(
-            extractSlice, extractSlice.getSource(), mixedOffsets, mixedSizes,
-            mixedStrides);
+        if (useShrinkedLayout) {
+          rewriter.replaceOpWithNewOp<tensor::ExtractSliceOp>(
+              extractSlice,
+              mlir::RankedTensorType::get(
+                  SmallVector<int64_t>(CInnermostDims.begin() + 2,
+                                       CInnermostDims.end()),
+                  resultType.getElementType()),
+              extractSlice.getSource(), mixedOffsets, mixedSizes, mixedStrides);
+        } else {
+          rewriter.replaceOpWithNewOp<tensor::ExtractSliceOp>(
+              extractSlice, extractSlice.getSource(), mixedOffsets, mixedSizes,
+              mixedStrides);
+        }
       }
-      auto dataType = dyn_cast<mlir::RankedTensorType>(
-          genericOp.getDpsInputs()[0].getType());
-      auto weightType = dyn_cast<mlir::RankedTensorType>(
-          genericOp.getDpsInputs()[1].getType());
-      auto resultType = dyn_cast<mlir::RankedTensorType>(
-          genericOp.getDpsInits()[0].getType());
       // View the tensor to brgemm required format
       Value dataOprand = tensorViewRankedTensor(
           rewriter,
           mlir::RankedTensorType::get(
               useBlockedLayout
-                  ? SmallVector<int64_t>{cfg.KBlock / cfg.innerMostKBlock,
-                                         cfg.innerMostMBlock,
-                                         cfg.innerMostKBlock}
+                  ? SmallVector<int64_t>(AInnermostDims.begin() + 1,
+                                         AInnermostDims.end())
                   : SmallVector<int64_t>{1, cfg.innerMostMBlock,
                                          cfg.KBlock / cfg.innerMostKBlock *
                                              cfg.innerMostKBlock},
@@ -539,9 +687,8 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
           rewriter,
           mlir::RankedTensorType::get(
               useBlockedLayout
-                  ? SmallVector<int64_t>{cfg.KBlock / cfg.innerMostKBlock,
-                                         cfg.innerMostKBlock,
-                                         cfg.innerMostNBlock}
+                  ? SmallVector<int64_t>(BInnermostDims.begin() + 1,
+                                         BInnermostDims.end())
                   : SmallVector<int64_t>{1,
                                          cfg.KBlock / cfg.innerMostKBlock *
                                              cfg.innerMostKBlock,
@@ -551,14 +698,21 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
       Value resultOprand = tensorViewRankedTensor(
           rewriter,
           mlir::RankedTensorType::get(
-              SmallVector<int64_t>{cfg.innerMostMBlock, cfg.innerMostNBlock},
+              SmallVector<int64_t>(CInnermostDims.begin() + 2,
+                                   CInnermostDims.end()),
               resultType.getElementType()),
           genericOp.getDpsInits()[0]);
-
       // Create the brgemm op
-      linalg::LinalgOp matmul = rewriter.create<linalg::BatchReduceMatmulOp>(
-          resultOprand.getLoc(), resultOprand.getType(),
-          ValueRange{dataOprand, weightOprand}, resultOprand);
+      linalg::LinalgOp matmul;
+      if (BInnermostDims.size() == 4) {
+        matmul = rewriter.create<linalg::BatchReduceMatmulOp>(
+            resultOprand.getLoc(), resultOprand.getType(),
+            ValueRange{dataOprand, weightOprand}, resultOprand);
+      } else {
+        IRMapping mapping;
+        matmul = dyn_cast<linalg::LinalgOp>(
+            *rewriter.clone(*(genericOp.getOperation())));
+      }
       Value result = matmul.getOperation()->getResult(0);
       // Insert the result back to the original tensor
       for (Operation *user : genericOp->getResult(0).getUsers()) {
@@ -570,12 +724,8 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
           SmallVector<OpFoldResult> mixedSizes = insertSlice.getMixedSizes();
           SmallVector<OpFoldResult> mixedStrides =
               insertSlice.getMixedStrides();
-          SmallVector<int64_t> staticSize =
-              useBlockedLayout ? SmallVector<int64_t>{1, 1, cfg.innerMostMBlock,
-                                                      cfg.innerMostNBlock}
-                               : SmallVector<int64_t>{cfg.innerMostMBlock,
-                                                      cfg.innerMostNBlock};
-          for (auto i = 0; i < mixedSizes.size(); i++) {
+          SmallVector<int64_t> staticSize = CInnermostDims;
+          for (auto i = 0UL; i < mixedSizes.size(); i++) {
             mixedSizes[i] =
                 getAsIndexOpFoldResult(rewriter.getContext(), staticSize[i]);
           }
@@ -599,7 +749,9 @@ struct rewriteToNestedMatmul : public OpRewritePattern<LinalgOpTy> {
       mapping.map(genericOp.getDpsInits()[0], fillOp.getResult(0));
       auto res = rewriter.clone(*(genericOp.getOperation()), mapping);
       rewriter.replaceOp(genericOp, res);
+      genericOp = dyn_cast<linalg::LinalgOp>(res);
     }
+    genericOp.getOperation()->getParentOfType<ModuleOp>().dump();
     return success();
   }
 };
